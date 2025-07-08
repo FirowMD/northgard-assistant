@@ -1,0 +1,38 @@
+{
+    "clan": "Rat",
+    "lore_order": [
+        "Sharp Axes",
+        "Healing Fire",
+        "Medicine",
+        "Overcrowding",
+        "Coinage",
+        "Carpentry Mastery",
+        "Jörd's Blessing",
+        "Enrollment",
+        "Pain Suppressant",
+        "Military Strategy",
+        "Baldr's Blessing",
+        "Blood Ties"
+    ],
+    "guide": [
+        {
+            "label": "800", // Our group names
+            "description": "Summon warchief. Upgrade townhall.",
+            "buildings": [
+                "Scout camp",
+                "Market",
+                "Woodcutter",
+                "Food building",
+                "Mine"
+            ],
+			"units": [
+				"Eir"
+			]
+        },
+        {
+            "label": "801", // 2nd group name
+            "description": "Reach 200 fame asap. Upgrade merchants, food bringers and shamans. Upgrade 1 food building, 2 markets or tradeposts."
+        }
+    ]
+
+}

@@ -1,0 +1,48 @@
+{
+    "clan": "Rat",
+    "lore_order": [
+        "Sharp Axes",
+        "Healing Fire",
+        "Medicine",
+        "Overcrowding",
+        "Coinage",
+        "Carpentry Mastery",
+        "J\u00f6rd's Blessing",
+        "Enrollment",
+        "Pain Suppressant",
+        "Military Strategy",
+        "Baldr's Blessing",
+        "Blood Ties"
+    ],
+    "groups": {
+        "800": {
+            "buildings": [
+                "Scout Camp",
+                "Marketplace",
+                "Woodcutter's Lodge",
+                "Fields",
+                "Mine"
+            ],
+            "units": [
+                "Eir"
+            ],
+            "description": "During 800 you have to:\n- summon warchief and 1 shaman\n- upgrade townhall"
+        },
+        "801": {
+            "buildings": [
+                "Town Hall"
+            ],
+            "units": [
+                "Shaman"
+            ],
+            "description": "During 801 you have to:\n- reach 200 fame asap\n- upgrade merchants, food bringers and shamans\n- upgrade 1 food building, 2 markets or tradeposts"
+        },
+        "802": {
+            "buildings": [],
+            "units": [
+                "Garm's Incarnation"
+            ],
+            "description": "You must be prepared to convert at the beginning of the year"
+        }
+    }
+}
