@@ -1,6 +1,8 @@
 # northgard-assistant
 Overlay for northgard
 
+[Download](https://github.com/FirowMD/northgard-assistant/releases)
+
 # Features
 - Auto accept
 - Auto lock in clan/color
