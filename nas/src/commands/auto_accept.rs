@@ -1,49 +1,65 @@
-use crate::commands::basic::*;
-use crate::commands::aob_injection::AobInjection;
-use std::error::Error;
-use std::sync::Mutex;
-use windows::Win32::System::Memory::{PAGE_EXECUTE, PAGE_EXECUTE_READ, PAGE_EXECUTE_READWRITE};
+use crate::commands::base::{Command, InjectionManager};
 use iced_x86::code_asm::*;
+use std::error::Error;
 
-static INJECTION: Mutex<Option<AobInjection>> = Mutex::new(None);
-
-/// Initialize auto-accept by finding the target address
-/// Returns the target address if found
-pub fn auto_accept_init(pid: u32) -> Result<usize, Box<dyn Error>> {
-    let hex_pattern = "88 ?? ?? 48 8B ?? ?? ?? ?? ?? 48 89 ?? ?? 48 85 ?? 75 ?? 48 83 ?? ?? 68 ?? ?? ?? ?? 48 B8 ?? ?? ?? ?? ?? ?? ?? ?? 48 83 ?? ?? FF ?? 48 89 ?? ?? ?? 4C ?? ?? ?? 4C ?? ?? ?? 49 ?? ?? 48 B9 ?? ?? ?? ?? ?? ?? ?? ?? 48 B8 ?? ?? ?? ?? ?? ?? ?? ?? 48 83 ?? ?? FF ?? 48 89 ?? ?? ?? 48 83 ?? ?? 48 89 ?? ?? 48 85 ?? 75 ?? 48 B8 ?? ?? ?? ?? ?? ?? ?? ?? 48 83 ?? ?? FF ?? 48 89 ?? ?? ?? 48 33 ?? 8A ?? ?? 48 8B ?? 48 B8 ?? ?? ?? ?? ?? ?? ?? ?? 48 83 ?? ?? FF ?? 48 89 ?? ?? ?? 48 83 ?? ?? 48 89 ?? ?? 4C ?? ?? ?? 4D ?? ?? ?? 4D ?? ?? 75 ?? 4C ?? ?? 49 ?? ?? ?? ?? ?? ?? ?? ?? ?? 48 BA ?? ?? ?? ?? ?? ?? ?? ?? 49 ?? ?? 48 B8 ?? ?? ?? ?? ?? ?? ?? ?? 48 83 ?? ?? FF ?? 48 89 ?? ?? ?? 48 83 ?? ?? EB ?? 4C ?? ?? ?? 4D ?? ?? 4C ?? ?? ?? 49 ?? ?? ?? ?? ?? ?? 48 89 ?? ?? 48 85 ?? 75 ?? 48 B8 ?? ?? ?? ?? ?? ?? ?? ?? 48 83 ?? ?? FF ?? 48 89 ?? ?? ?? 48 33 ?? 48 89 ?? ?? 4C ?? ?? 4D ?? ?? ?? 48 8B ?? 48 8B ?? ?? 48 83 ?? ?? 41 ?? ?? ?? 48 89 ?? ?? ?? 48 83 ?? ?? 48 8B ?? ?? 48 83 ?? ?? 5D 48 C3";
-    
-    // Scan only executable memory regions
-    let executable_protection = PAGE_EXECUTE.0 | PAGE_EXECUTE_READ.0 | PAGE_EXECUTE_READWRITE.0;
-    let addrs = aob_scan_mrprotect(pid, hex_pattern, executable_protection)?;
-    
-    if addrs.is_empty() {
-        tracing::error!("Pattern not found: auto_accept_init: hex_pattern");
-        return Err("Pattern not found: auto_accept_init: hex_pattern".into());
-    }
-
-    let target_address = addrs[0];
-    tracing::info!("Found target at: {:#016x}", target_address);
-    
-    Ok(target_address)
+pub struct AutoAccept {
+    address_setcheckedjoin: usize,
+    enabled: bool,
+    injection_manager: InjectionManager,
 }
 
-/// Apply or remove auto-accept at the specified address
-pub fn auto_accept_apply(pid: u32, address: usize, enable: bool) -> Result<bool, Box<dyn Error>> {
-    let mut injection = INJECTION.lock().unwrap();
-    
-    if enable {
-        if injection.is_none() {
+impl AutoAccept {
+    pub fn new() -> Self {
+        Self {
+            address_setcheckedjoin: 0,
+            enabled: false,
+            injection_manager: InjectionManager::new(0), // Will be updated in init
+        }
+    }
+
+    pub fn auto_accept_apply(&mut self, enable: bool) -> Result<(), Box<dyn Error>> {
+        self.apply(enable)
+    }
+}
+
+impl Command for AutoAccept {
+    fn init(&mut self, ctx: &mut crate::commands::base::CommandContext) -> Result<(), Box<dyn Error>> {
+        const OFFSET_SETCHECKEDJOIN: usize = 12;
+        
+        // Update injection manager with correct PID
+        self.injection_manager = InjectionManager::new(ctx.pid);
+        self.injection_manager.add_injection("setCheckedJoin".to_string());
+
+        // Get function address using context helper
+        self.address_setcheckedjoin = ctx.get_function_address("setCheckedJoin", Some(0))?;
+        self.address_setcheckedjoin += OFFSET_SETCHECKEDJOIN;
+
+        Ok(())
+    }
+
+    fn apply(&mut self, enable: bool) -> Result<(), Box<dyn Error>> {
+        if enable {
             let mut code = CodeAssembler::new(64)?;
             code.mov(dl, 1)?;
             
-            *injection = Some(AobInjection::new(pid, address, &mut code)?);
-            tracing::info!("Successfully injected auto-accept code");
+            self.injection_manager.apply_injection(
+                "setCheckedJoin", 
+                self.address_setcheckedjoin, 
+                &mut code
+            )?;
+        } else {
+            self.injection_manager.remove_injection("setCheckedJoin")?;
         }
-    } else if let Some(inj) = injection.as_ref() {
-        inj.undo()?;
-        *injection = None;
-        tracing::info!("Successfully removed auto-accept code");
+
+        self.enabled = enable;
+        Ok(())
     }
-    
-    Ok(enable)
+
+    fn is_enabled(&self) -> bool {
+        self.enabled
+    }
+
+    fn name(&self) -> &'static str {
+        "AutoAccept"
+    }
 }

@@ -1,12 +1,11 @@
-use crate::commands::aob_injection::AobInjection;
+use crate::commands::base::InjectionManager;
 use crate::commands::mem_alloc::*;
 use crate::commands::hashlink::*;
 use iced_x86::code_asm::*;
 use std::error::Error;
-use std::sync::Mutex;
 
 pub struct AutoLockin {
-    pid: u32,
+    pid: u32, // Keep pid for now since this struct has complex memory management
     clan_current: Option<usize>,
     clan_array: Option<Vec<String>>,
     color_current: Option<usize>,
@@ -16,36 +15,25 @@ pub struct AutoLockin {
     color_enabled: bool,
     clan_name: Option<String>,
     
-    // fn __alloc__@16
+    // Function addresses
     address_allocstring: usize,
-    // fn parseInt@18609
     address_parseint: usize,
-    // fn changeMyClan@26505
     address_changemyclan: usize,
-    // fn changeMyColor@26515
     address_changemycolor: usize,
-    // fn canReady@26525
     address_canready: usize,
     address_canready_end: usize,
-    // fn clanUnlockedByDLC@22880
     address_clanunlockedbydlc: usize,
-    // gamesys.LobbyManager
+    
+    // Variable pointers
     var_ptr_lobbymanager: usize,
-    // String
     var_ptr_clan: usize,
-    // Address of clans
     var_ptr_arrayclans: Vec<usize>,
-    // Address of colors
     var_ptr_arraycolors: Vec<usize>,
-    // Check if we already locked in clan
     var_ptr_lockedin: usize,
-    // Color (String)
     var_ptr_color: usize,
-    // Color (Int)
     var_ptr_color_int: usize,
 
-    injection_canready: Mutex<Option<AobInjection>>,
-    injection_canready_end: Mutex<Option<AobInjection>>,
+    injection_manager: InjectionManager,
     mem_allocator: MemoryAllocator,
 }
 
@@ -57,6 +45,10 @@ impl AutoLockin {
         let var_ptr_color_int_tmp = memory_allocator.allocate_var("ColorInt", DataType::Pointer)?;
         let var_ptr_lobbymanager_tmp = memory_allocator.allocate_var("gamesys.LobbyManager", DataType::Pointer)?;
         let var_ptr_lockedin_tmp = memory_allocator.allocate_var("gamesys.LobbyManager.LockedIn", DataType::Pointer)?;
+
+        let mut injection_manager = InjectionManager::new(pid);
+        injection_manager.add_injection("canready".to_string());
+        injection_manager.add_injection("canready_end".to_string());
 
         let mut auto_lockin = Self {
             pid,
@@ -81,8 +73,7 @@ impl AutoLockin {
             var_ptr_arraycolors: vec![],
             var_ptr_color: var_ptr_color_tmp,
             var_ptr_color_int: var_ptr_color_int_tmp,
-            injection_canready: Mutex::new(None),
-            injection_canready_end: Mutex::new(None),
+            injection_manager,
             mem_allocator: memory_allocator,
         };
 
@@ -113,7 +104,7 @@ impl AutoLockin {
     }
     
     pub fn init_clans(&mut self) -> Result<(), Box<dyn Error>> {
-        let clans = vec!["Bear", "Boar", "Dragon", "Eagle", "Pack", "Goat", "Horse", "Kraken", "Lion", "Lynx", "Owl", "Ox", "Rat", "Raven", "Snake", "Squirrel", "Stag", "Stoat", "Turtle", "Wolf"];
+        let clans = vec!["Bear", "Boar", "Dragon", "Eagle", "Pack", "Goat", "Hippogriff", "Horse", "Kraken", "Lion", "Lynx", "Owl", "Ox", "Rat", "Raven", "Snake", "Squirrel", "Stag", "Stoat", "Turtle", "Wolf"];
 
         self.clan_array = Some(clans.iter().map(|s| s.to_string()).collect());
 
@@ -168,20 +159,21 @@ impl AutoLockin {
             "Eagle" => 3,
             "Garm" => 4,
             "Goat" => 5,
-            "Horse" => 6,
-            "Kraken" => 7,
-            "Lion" => 8,
-            "Lynx" => 9,
-            "Owl" => 10,
-            "Ox" => 11,
-            "Rat" => 12,
-            "Raven" => 13,
-            "Snake" => 14,
-            "Squirrel" => 15,
-            "Stag" => 16,
-            "Stoat" => 17,
-            "Turtle" => 18,
-            "Wolf" => 19,
+            "Hippogriff" => 6,
+            "Horse" => 7,
+            "Kraken" => 8,
+            "Lion" => 9,
+            "Lynx" => 10,
+            "Owl" => 11,
+            "Ox" => 12,
+            "Rat" => 13,
+            "Raven" => 14,
+            "Snake" => 15,
+            "Squirrel" => 16,
+            "Stag" => 17,
+            "Stoat" => 18,
+            "Turtle" => 19,
+            "Wolf" => 20,
             _ => 5, // `Goat` is default clan
         };
 
@@ -206,57 +198,42 @@ impl AutoLockin {
     }
 
     pub fn auto_lockin_apply(&mut self) -> Result<(), Box<dyn Error>> {
-        let mut injection_canready = self.injection_canready.lock().unwrap();
-        let mut injection_canready_end = self.injection_canready_end.lock().unwrap();
+        // Remove existing injections
+        self.injection_manager.remove_injection("canready")?;
+        self.injection_manager.remove_injection("canready_end")?;
 
-        // Remove injections
-        if let Some(inj) = injection_canready.as_ref() {
-            inj.undo()?;
-            *injection_canready = None;
-            tracing::info!("Successfully removed: canready at 0x{:X}", self.address_canready);
-        }
+        // Apply canready injection
+        let mut code = CodeAssembler::new(64)?;
+        code.push(rax)?;
+        code.push(rcx)?;
+        code.push(rdx)?;
 
-        if let Some(inj) = injection_canready_end.as_ref() {
-            inj.undo()?;
-            *injection_canready_end = None;
-            tracing::info!("Successfully removed: canready_end at 0x{:X}", self.address_canready_end);
-        }
+        // Save `gamesys.LobbyManager` to `var_ptr_lobbymanager`
+        code.mov(rax, self.var_ptr_lobbymanager as u64)?;
+        code.mov(qword_ptr(rax), rcx)?;
 
-        // Apply injections
-        if injection_canready.is_none() {
-            let mut code = CodeAssembler::new(64)?;
-            code.push(rax)?;
-            code.push(rcx)?;
-            code.push(rdx)?;
+        code.pop(rdx)?;
+        code.pop(rcx)?;
+        code.pop(rax)?;
 
-            // Save `gamesys.LobbyManager` to `var_ptr_lobbymanager`
-            code.mov(rax, self.var_ptr_lobbymanager as u64)?;
-            code.mov(qword_ptr(rax), rcx)?;
+        self.injection_manager.apply_injection("canready", self.address_canready, &mut code)?;
 
-            code.pop(rdx)?;
-            code.pop(rcx)?;
-            code.pop(rax)?;
+        // Apply canready_end injection
+        let mut code_end = CodeAssembler::new(64)?;
+        let mut label_end = code_end.create_label();
 
-            *injection_canready = Some(AobInjection::new(self.pid, self.address_canready, &mut code)?);
-            tracing::info!("Successfully injected: canready at 0x{:X}", self.address_canready);
-        }
+        code_end.pushfq()?;
+        code_end.push(rax)?;
+        code_end.push(rcx)?;
+        code_end.push(rdx)?;
 
-        if injection_canready_end.is_none() {    
-            let mut code = CodeAssembler::new(64)?;
-            let mut label_end = code.create_label();
-
-            code.pushfq()?;
-            code.push(rax)?;
-            code.push(rcx)?;
-            code.push(rdx)?;
-
-            // Compare `var_ptr_lockedin` and `var_ptr_lobbymanager`
-            code.mov(rax, self.var_ptr_lockedin as u64)?;
-            code.mov(rcx, qword_ptr(rax))?;
-            code.mov(rax, self.var_ptr_lobbymanager as u64)?;
-            code.mov(rdx, qword_ptr(rax))?;
-            code.cmp(rcx, rdx)?;
-            code.je(label_end)?;
+        // Compare `var_ptr_lockedin` and `var_ptr_lobbymanager`
+        code_end.mov(rax, self.var_ptr_lockedin as u64)?;
+        code_end.mov(rcx, qword_ptr(rax))?;
+        code_end.mov(rax, self.var_ptr_lobbymanager as u64)?;
+        code_end.mov(rdx, qword_ptr(rax))?;
+        code_end.cmp(rcx, rdx)?;
+        code_end.je(label_end)?;
 
             if self.clan_enabled {
                 let clan_addr = self.var_ptr_arrayclans[self.clan_current.unwrap()] as u64;
@@ -264,35 +241,35 @@ impl AutoLockin {
                     .unwrap()[self.clan_current.unwrap()].len() as u64;
 
                 // Call `allocString`
-                code.mov(rcx, clan_addr)?;
-                code.mov(rdx, clan_len)?;
-                code.mov(rax, self.address_allocstring as u64)?;
-                code.call(rax)?;
+                code_end.mov(rcx, clan_addr)?;
+                code_end.mov(rdx, clan_len)?;
+                code_end.mov(rax, self.address_allocstring as u64)?;
+                code_end.call(rax)?;
 
                 // Save `allocString` result to `var_ptr_clan`
-                code.mov(rcx, self.var_ptr_clan as u64)?;
-                code.mov(qword_ptr(rcx), rax)?;
+                code_end.mov(rcx, self.var_ptr_clan as u64)?;
+                code_end.mov(qword_ptr(rcx), rax)?;
 
                 // Do not check if base clan
                 if !self.get_base_clans().contains(&self.clan_name.as_ref().unwrap().as_str()) {
                     // Call `clanUnlockedByDLC`
-                    code.mov(rax, self.var_ptr_clan as u64)?;
-                    code.mov(rcx, qword_ptr(rax))?;
-                    code.mov(rax, self.address_clanunlockedbydlc as u64)?;
-                    code.call(rax)?;
+                    code_end.mov(rax, self.var_ptr_clan as u64)?;
+                    code_end.mov(rcx, qword_ptr(rax))?;
+                    code_end.mov(rax, self.address_clanunlockedbydlc as u64)?;
+                    code_end.call(rax)?;
 
                     // Compare result of `clanUnlockedByDLC` and 0
-                    code.cmp(rax, 0)?;
-                    code.je(label_end)?;
+                    code_end.cmp(rax, 0)?;
+                    code_end.je(label_end)?;
                 }
 
                 // Call `changeMyClan`
-                code.mov(rax, self.var_ptr_clan as u64)?;
-                code.mov(rdx, qword_ptr(rax))?;
-                code.mov(rax, self.var_ptr_lobbymanager as u64)?;
-                code.mov(rcx, qword_ptr(rax))?;
-                code.mov(rax, self.address_changemyclan as u64)?;
-                code.call(rax)?;
+                code_end.mov(rax, self.var_ptr_clan as u64)?;
+                code_end.mov(rdx, qword_ptr(rax))?;
+                code_end.mov(rax, self.var_ptr_lobbymanager as u64)?;
+                code_end.mov(rcx, qword_ptr(rax))?;
+                code_end.mov(rax, self.address_changemyclan as u64)?;
+                code_end.call(rax)?;
             }
 
             if self.color_enabled {
@@ -301,43 +278,41 @@ impl AutoLockin {
                     .unwrap()[self.color_current.unwrap()].len() as u64;
                 
                 // Call `allocString`
-                code.mov(rcx, color_addr)?;
-                code.mov(rdx, color_len)?;
-                code.mov(rax, self.address_allocstring as u64)?;
-                code.call(rax)?;
+                code_end.mov(rcx, color_addr)?;
+                code_end.mov(rdx, color_len)?;
+                code_end.mov(rax, self.address_allocstring as u64)?;
+                code_end.call(rax)?;
 
                 // Save `allocString` result to `var_ptr_color`
-                code.mov(rcx, self.var_ptr_color as u64)?;
-                code.mov(qword_ptr(rcx), rax)?;
+                code_end.mov(rcx, self.var_ptr_color as u64)?;
+                code_end.mov(qword_ptr(rcx), rax)?;
 
                 // Call `parseInt`
-                code.mov(rax, self.var_ptr_color as u64)?;
-                code.mov(rcx, qword_ptr(rax))?;
-                code.mov(rax, self.address_parseint as u64)?;
-                code.call(rax)?;
+                code_end.mov(rax, self.var_ptr_color as u64)?;
+                code_end.mov(rcx, qword_ptr(rax))?;
+                code_end.mov(rax, self.address_parseint as u64)?;
+                code_end.call(rax)?;
 
                 // Save `parseInt` result to `var_ptr_color_int`
-                code.mov(rcx, self.var_ptr_color_int as u64)?;
-                code.mov(qword_ptr(rcx), rax)?;
+                code_end.mov(rcx, self.var_ptr_color_int as u64)?;
+                code_end.mov(qword_ptr(rcx), rax)?;
 
                 // Call `changeMyColor`
-                code.mov(rax, self.var_ptr_color_int as u64)?;
-                code.mov(rdx, qword_ptr(rax))?;
-                code.mov(rax, self.var_ptr_lobbymanager as u64)?;
-                code.mov(rcx, qword_ptr(rax))?;
-                code.mov(rax, self.address_changemycolor as u64)?;
-                code.call(rax)?;
+                code_end.mov(rax, self.var_ptr_color_int as u64)?;
+                code_end.mov(rdx, qword_ptr(rax))?;
+                code_end.mov(rax, self.var_ptr_lobbymanager as u64)?;
+                code_end.mov(rcx, qword_ptr(rax))?;
+                code_end.mov(rax, self.address_changemycolor as u64)?;
+                code_end.call(rax)?;
             }
 
-            code.set_label(&mut label_end)?;
-            code.pop(rdx)?;
-            code.pop(rcx)?;
-            code.pop(rax)?;
-            code.popfq()?;
+        code_end.set_label(&mut label_end)?;
+        code_end.pop(rdx)?;
+        code_end.pop(rcx)?;
+        code_end.pop(rax)?;
+        code_end.popfq()?;
 
-            *injection_canready_end = Some(AobInjection::new(self.pid, self.address_canready_end, &mut code)?);
-            tracing::info!("Successfully injected: canready_end at 0x{:X}", self.address_canready_end);
-        }
+        self.injection_manager.apply_injection("canready_end", self.address_canready_end, &mut code_end)?;
 
         Ok(())
     }

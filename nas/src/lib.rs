@@ -17,7 +17,7 @@ pub unsafe extern "stdcall" fn DllMain(
     _: *mut std::ffi::c_void,
 ) {
     if reason == hudhook::windows::Win32::System::SystemServices::DLL_PROCESS_ATTACH {
-        main_window::setup_tracing();
+        // main_window::setup_tracing();
         hudhook::tracing::trace!("DllMain()");
         let _ = std::thread::spawn(move || {
             if let Err(e) = hudhook::Hudhook::builder()

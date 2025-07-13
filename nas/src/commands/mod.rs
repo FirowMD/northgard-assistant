@@ -1,6 +1,7 @@
 pub mod aob_injection;
 pub mod auto_accept;
 pub mod auto_lockin;
+pub mod base;
 pub mod basic;
 pub mod game_common;
 pub mod hashlink;
@@ -12,6 +13,7 @@ pub mod build_guide;
 pub use aob_injection::*;
 pub use auto_accept::*;
 pub use auto_lockin::*;
+pub use base::*;
 pub use game_common::*;
 pub use hashlink::*;
 pub use lobby_members::*;

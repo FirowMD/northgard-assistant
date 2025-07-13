@@ -7,7 +7,8 @@ use imgui::Condition;
 use imgui::Key;
 use tracing_subscriber::prelude::*;
 use tracing_subscriber::{fmt, EnvFilter};
-use crate::commands::auto_accept::{auto_accept_init, auto_accept_apply};
+use crate::commands::auto_accept::AutoAccept;
+use crate::commands::base::{Command, CommandContext};
 use crate::commands::lobby_members::LobbyMembers;
 use crate::commands::auto_lockin::AutoLockin;
 use crate::commands::game_common::GameCommon;
@@ -66,8 +67,8 @@ pub struct MainWindow {
 
     /// General
     pid: u32,
-    auto_accept_target_address: usize,
-    auto_accept_enabled: bool,
+    command_context: Option<CommandContext>,
+    auto_accept: Option<AutoAccept>,
     auto_lockin: Option<AutoLockin>,
     game_common: Option<Arc<GameCommon>>,
     lobby_members: Option<LobbyMembers>,
@@ -87,8 +88,8 @@ impl MainWindow {
             window_visible: true,
             selected_clan: None,
             pid: 0,
-            auto_accept_target_address: 0,
-            auto_accept_enabled: false,
+            command_context: None,
+            auto_accept: None,
             auto_lockin: None,
             game_common: None,
             lobby_members: None,
@@ -162,7 +163,17 @@ impl ImguiRenderLoop for MainWindow {
         
         ctx.fonts().build_rgba32_texture();
 
-        self.auto_accept_target_address = auto_accept_init(self.pid).unwrap();
+        // Initialize command context
+        self.command_context = Some(CommandContext::new(self.pid).unwrap());
+        
+        // Initialize AutoAccept with new pattern
+        let mut auto_accept = AutoAccept::new();
+        if let Some(ctx) = &mut self.command_context {
+            auto_accept.init(ctx).unwrap();
+        }
+        self.auto_accept = Some(auto_accept);
+        
+        // Keep AutoLockin with old pattern for now
         self.auto_lockin = Some(AutoLockin::new(self.pid).unwrap());
         match GameCommon::new(self.pid) {
             Ok(mut game_common) => {
@@ -216,11 +227,13 @@ impl ImguiRenderLoop for MainWindow {
                             return;
                         }
 
-                        if let Err(e) = auto_accept_apply(self.pid, self.auto_accept_target_address, self.checkbox_auto_accept) {
-                            tracing::error!("Auto-accept failed: {}", e);
-                            self.checkbox_auto_accept = prev_state;
-                        } else {
-                            tracing::info!("Auto-accept {}", if self.checkbox_auto_accept { "enabled" } else { "disabled" });
+                        if let Some(auto_accept) = &mut self.auto_accept {
+                            if let Err(e) = auto_accept.auto_accept_apply(self.checkbox_auto_accept) {
+                                tracing::error!("Auto-accept failed: {}", e);
+                                self.checkbox_auto_accept = prev_state;
+                            } else {
+                                tracing::info!("Auto-accept {}", if self.checkbox_auto_accept { "enabled" } else { "disabled" });
+                            }
                         }
                     }
 

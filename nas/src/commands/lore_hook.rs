@@ -16,10 +16,8 @@ use crate::commands::mem_alloc::*;
 use crate::commands::hashlink::*;
 use crate::commands::basic::*;
 use crate::utils::signals::*;
-use iced_x86::code_asm::*;
 use std::error::Error;
 use std::sync::Mutex;
-use std::mem;
 use windows::Win32::System::Memory::{PAGE_EXECUTE, PAGE_EXECUTE_READ, PAGE_EXECUTE_READWRITE};
 
 
@@ -49,7 +47,7 @@ pub struct LoreHook {
 
 impl LoreHook {
     pub fn new(pid: u32) -> Result<Self, Box<dyn Error>> {
-        let mut memory_allocator = MemoryAllocator::new(pid, 0x1000)?;
+        let memory_allocator = MemoryAllocator::new(pid, 0x1000)?;
         
         let mut lore_hook = Self {
             pid,
