@@ -1,9 +1,9 @@
-pub mod commands;
+pub mod modules;
 pub mod utils;
 pub mod core;
 
 // Re-export commonly used items
-pub use commands::*;
+pub use modules::*;
 pub use utils::*;
 
 use hudhook::*;

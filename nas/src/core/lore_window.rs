@@ -1,6 +1,6 @@
 use hudhook::*;
 use imgui::{Condition, WindowFlags};
-use crate::commands::game_common::GameCommon;
+use crate::modules::game_common::GameCommon;
 use std::sync::Arc;
 
 pub struct LoreWindow {
