@@ -9,6 +9,7 @@ pub mod lobby_members;
 pub mod lore_hook;
 pub mod mem_alloc;
 pub mod build_guide;
+pub mod leaderboard_scores;
 
 pub use aob_injection::*;
 pub use auto_accept::*;
@@ -20,3 +21,4 @@ pub use lobby_members::*;
 pub use lore_hook::*;
 pub use mem_alloc::*;
 pub use build_guide::*;
+pub use leaderboard_scores::*;

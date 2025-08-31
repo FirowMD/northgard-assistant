@@ -1,6 +1,6 @@
-use crate::commands::base::InjectionManager;
-use crate::commands::mem_alloc::*;
-use crate::commands::hashlink::*;
+use crate::modules::base::InjectionManager;
+use crate::modules::mem_alloc::*;
+use crate::modules::hashlink::*;
 use iced_x86::code_asm::*;
 use std::error::Error;
 

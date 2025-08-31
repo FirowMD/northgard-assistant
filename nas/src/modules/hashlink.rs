@@ -2,7 +2,7 @@
     Singleton that allows to use hashlink functions through a simple interface
 */
 
-use crate::commands::basic::*;
+use crate::modules::basic::*;
 use std::error::Error;
 use std::sync::{Mutex, Once};
 use windows::Win32::System::Memory::{PAGE_EXECUTE, PAGE_EXECUTE_READ, PAGE_EXECUTE_READWRITE, PAGE_READWRITE};

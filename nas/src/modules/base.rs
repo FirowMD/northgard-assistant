@@ -1,6 +1,6 @@
-use crate::commands::aob_injection::AobInjection;
-use crate::commands::mem_alloc::*;
-use crate::commands::hashlink::*;
+use crate::modules::aob_injection::AobInjection;
+use crate::modules::mem_alloc::*;
+use crate::modules::hashlink::*;
 use std::error::Error;
 use std::sync::Mutex;
 use std::collections::HashMap;

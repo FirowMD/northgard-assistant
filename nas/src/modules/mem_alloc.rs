@@ -1,5 +1,5 @@
 use crate::utils::memory::{MemoryRegion, allocate_region};
-use crate::commands::basic::*;
+use crate::modules::basic::*;
 use windows::Win32::System::Threading::{OpenProcess, PROCESS_VM_WRITE, PROCESS_VM_OPERATION, PROCESS_VM_READ};
 use windows::Win32::System::Diagnostics::Debug::{WriteProcessMemory, ReadProcessMemory};
 use windows::Win32::Foundation::{HANDLE, BOOL, CloseHandle};

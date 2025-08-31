@@ -1,7 +1,7 @@
-use crate::commands::basic::*;
-use crate::commands::aob_injection::AobInjection;
-use crate::commands::mem_alloc::*;
-use crate::commands::hashlink::*;
+use crate::modules::basic::*;
+use crate::modules::aob_injection::AobInjection;
+use crate::modules::mem_alloc::*;
+use crate::modules::hashlink::*;
 use iced_x86::code_asm::*;
 use std::error::Error;
 use std::sync::Mutex;

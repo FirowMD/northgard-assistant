@@ -1,4 +1,4 @@
-use crate::commands::base::{Command, InjectionManager};
+use crate::modules::base::{Command, InjectionManager};
 use iced_x86::code_asm::*;
 use std::error::Error;
 
@@ -23,7 +23,7 @@ impl AutoAccept {
 }
 
 impl Command for AutoAccept {
-    fn init(&mut self, ctx: &mut crate::commands::base::CommandContext) -> Result<(), Box<dyn Error>> {
+    fn init(&mut self, ctx: &mut crate::modules::base::CommandContext) -> Result<(), Box<dyn Error>> {
         const OFFSET_SETCHECKEDJOIN: usize = 12;
         
         // Update injection manager with correct PID
