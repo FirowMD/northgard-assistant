@@ -4,11 +4,13 @@
     - get_premade - to execute our code, which will receive actual player ranks
 */
 
-use crate::modules::base::{Command, CommandContext, InjectionManager};
+use crate::modules::base::{Command, CommandContext, InjectionManager, aob_scan_mrprotect};
 use crate::modules::mem_alloc::{MemoryAllocator, DataType};
+use crate::modules::hashlink::*;
 use crate::utils::memory::{read_bytes, write_byte};
 use windows::Win32::System::Threading::{OpenProcess, PROCESS_VM_READ};
 use windows::Win32::System::Diagnostics::Debug::ReadProcessMemory;
+use windows::Win32::System::Memory::{PAGE_EXECUTE, PAGE_EXECUTE_READ, PAGE_EXECUTE_READWRITE};
 use windows::Win32::Foundation::BOOL;
 use iced_x86::code_asm::*;
 use std::error::Error;
@@ -35,6 +37,7 @@ pub struct LeaderboardScores {
     address_ssl_new: usize,
     address_get_premade: usize,
     injection_manager: InjectionManager,
+    memory_allocator: MemoryAllocator,
     enabled: bool,
     
     // Buffer management
@@ -56,7 +59,7 @@ impl LeaderboardScores {
         let var_ptr_sendbuffer = memory_allocator.allocate_var_with_size("SendBuffer", DataType::ByteArray, MAX_LB_SEND_BUFSIZE)?;
         let var_ptr_recvbuffer = memory_allocator.allocate_var_with_size("RecvBuffer", DataType::ByteArray, MAX_LB_RECV_BUFSIZE)?;
         let var_ptr_recvbufsize = memory_allocator.allocate_var("RecvBufSize", DataType::I32)?;
-        memory_allocator.write_var("RecvBufSize", MAX_LB_RECV_BUFSIZE)?;
+        
         let var_ptr_socket = memory_allocator.allocate_var("Socket", DataType::Pointer)?;
 
         let mut injection_manager = InjectionManager::new(pid);
@@ -70,6 +73,7 @@ impl LeaderboardScores {
             address_ssl_new: 0,
             address_get_premade: 0,
             injection_manager,
+            memory_allocator,
             enabled: false,
             var_ptr_sendbuffer,
             var_ptr_recvbuffer,
@@ -81,6 +85,8 @@ impl LeaderboardScores {
         };
 
         leaderboard_scores.init()?;
+        leaderboard_scores.set_leaderboard_type(LeaderboardType::Duels)?;
+        memory_allocator.write_var("RecvBufSize", MAX_LB_RECV_BUFSIZE)?;
 
         Ok(leaderboard_scores)
     }
@@ -112,7 +118,7 @@ impl LeaderboardScores {
             return Err("Pattern not found: ssl_new".into());
         }
 
-        let SSL_NEW_RET_OFFSET = 86;
+        const SSL_NEW_RET_OFFSET: usize = 86;
 
         self.address_ssl_send = addr_ssl_send[0];
         self.address_ssl_recv = addr_ssl_recv[0];
@@ -244,40 +250,30 @@ impl LeaderboardScores {
 
     pub fn set_leaderboard_type(&mut self, lb_type: LeaderboardType) -> Result<(), Box<dyn Error>> {
         self.leaderboard_type = lb_type;
-        
-        let request_data = match lb_type {
-            LeaderboardType::Duels => b"GET /api/leaderboard/duels HTTP/1.1\r\nHost: northgard.com\r\n\r\n",
-            LeaderboardType::FreeForAll => b"GET /api/leaderboard/ffa HTTP/1.1\r\nHost: northgard.com\r\n\r\n",
-            LeaderboardType::Teams => b"GET /api/leaderboard/teams HTTP/1.1\r\nHost: northgard.com\r\n\r\n",
+
+        // Currently, we support these requests:
+        // 81 7E 00 85 {"uid":46,"args":{"start":0,"v2":true,"count":40,"subrank":0,"season":"NG_RANK_TEAMS_16","game":"northgard"},"cmd":"ranking/getRank"}
+        // 81 7E 00 8A {"uid":45,"args":{"start":0,"v2":true,"count":40,"subrank":0,"season":"NG_RANK_FREEFORALL_16","game":"northgard"},"cmd":"ranking/getRank"}
+        // 81 7E 00 85 {"uid":44,"args":{"start":0,"v2":true,"count":40,"subrank":0,"season":"NG_RANK_DUELS_16","game":"northgard"},"cmd":"ranking/getRank"}
+
+        let (season, uid, header_byte) = match lb_type {
+            LeaderboardType::Duels => ("NG_RANK_DUELS_16", 44, 0x85),
+            LeaderboardType::FreeForAll => ("NG_RANK_FREEFORALL_16", 45, 0x8A),
+            LeaderboardType::Teams => ("NG_RANK_TEAMS_16", 46, 0x85),
         };
-        
-        self.sendbuf_size = request_data.len();
-        
-        let handle = unsafe {
-            OpenProcess(
-                windows::Win32::System::Threading::PROCESS_VM_WRITE | windows::Win32::System::Threading::PROCESS_VM_OPERATION,
-                BOOL::from(false),
-                self.pid,
-            )
-        }.map_err(|e| format!("Failed to open process: {:?}", e))?;
 
-        let mut bytes_written = 0;
-        unsafe {
-            windows::Win32::System::Diagnostics::Debug::WriteProcessMemory(
-                handle,
-                self.var_ptr_sendbuffer as *mut _,
-                request_data.as_ptr() as *const _,
-                request_data.len(),
-                Some(&mut bytes_written),
-            )
-        }.map_err(|_| "Failed to write send buffer")?;
+        let json_payload = format!(
+            r#"{{"uid":{},"args":{{"start":0,"v2":true,"count":{},"subrank":0,"season":"{}","game":"northgard"}},"cmd":"ranking/getRank"}}"#,
+            uid, self.observe_player_count, season
+        );
 
-        unsafe { let _ = windows::Win32::Foundation::CloseHandle(handle); }
-        
-        if bytes_written != request_data.len() {
-            return Err("Incomplete write to send buffer".into());
-        }
-        
+        let mut message = Vec::new();
+        message.extend_from_slice(&[0x81, 0x7E, 0x00, header_byte]);
+        message.extend_from_slice(json_payload.as_bytes());
+
+        self.sendbuf_size = message.len();
+        self.memory_allocator.write_byte_array("SendBuffer", &message)?;
+
         Ok(())
     }
 
