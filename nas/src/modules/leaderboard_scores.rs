@@ -15,10 +15,44 @@ use windows::Win32::Foundation::BOOL;
 use iced_x86::code_asm::*;
 use std::error::Error;
 
+const MAX_LB_MEMORY_REGION_SIZE: usize = 0x10000;
 const MAX_LB_SEND_BUFSIZE: i32 = 0x1000;
 const MAX_LB_RECV_BUFSIZE: i32 = 0x5000;
 const MAX_LB_OPLAYER_COUNT: i32 = 0x2000;
 const LB_OPLAYER_COUNT_DEFAULT: i32 = 40;
+
+// Request builder for leaderboard API calls
+struct LeaderboardRequestBuilder {
+    leaderboard_type: LeaderboardType,
+    observe_player_count: i32,
+}
+
+impl LeaderboardRequestBuilder {
+    fn new(lb_type: LeaderboardType, player_count: i32) -> Self {
+        Self {
+            leaderboard_type: lb_type,
+            observe_player_count: player_count,
+        }
+    }
+    
+    fn build_request(&self, uid: u32) -> Vec<u8> {
+        let (season, header_byte) = match self.leaderboard_type {
+            LeaderboardType::Duels => ("NG_RANK_DUELS_16", 0x85),
+            LeaderboardType::FreeForAll => ("NG_RANK_FREEFORALL_16", 0x8A),
+            LeaderboardType::Teams => ("NG_RANK_TEAMS_16", 0x85),
+        };
+
+        let json_payload = format!(
+            r#"{{"uid":{},"args":{{"start":0,"v2":true,"count":{},"subrank":0,"season":"{}","game":"northgard"}},"cmd":"ranking/getRank"}}"#,
+            uid, self.observe_player_count, season
+        );
+
+        let mut message = Vec::new();
+        message.extend_from_slice(&[0x81, 0x7E, 0x00, header_byte]);
+        message.extend_from_slice(json_payload.as_bytes());
+        message
+    }
+}
 
 #[derive(Clone, Copy)]
 pub enum LeaderboardType {
@@ -29,43 +63,90 @@ pub enum LeaderboardType {
 
 pub struct LeaderboardScores {
     pid: u32,
+    enabled: bool,
+
     address_ssl_send: usize,
     address_ssl_recv: usize,
+
+    // fn command@11808 (mpman.net.Connection, String, dynamic) -> mpman.Promise (22 regs, 45 ops)
+    address_command: usize,
+    // fn get_premade@30686 (ui.menus.multiplayer.LobbyFinderForm) -> mpman.Lobby (4 regs, 10 ops)
     address_get_premade: usize,
+    
     injection_manager: InjectionManager,
     memory_allocator: MemoryAllocator,
-    enabled: bool,
     
     // Buffer management
     var_ptr_sendbuffer: usize,
     var_ptr_recvbuffer: usize,
     var_ptr_recvbufsize: usize,
     var_ptr_socket: usize,
+    var_ptr_connection_uid: usize, // pointer to mpman.net.Connection->uid
+    var_ptr_uid: usize, // uid value itself
+    
+    // Callback infrastructure
+    var_ptr_self_instance: usize, // pointer to this LeaderboardScores instance
+    var_ptr_callback_addr: usize, // address of the callback function
 
     sendbuf_size: i32,
     
-    // Adjustable by user
-    observe_player_count: i32,
-    leaderboard_type: LeaderboardType,
+    // Request builder
+    request_builder: LeaderboardRequestBuilder,
 }
 
 impl LeaderboardScores {
+    // Callback function that can be called from assembly code
+    // Safety: This function is called from injected assembly code with proper arguments
+    extern "C" fn update_request_callback(instance_ptr: *mut LeaderboardScores, uid: u32) -> i32 {
+        if instance_ptr.is_null() {
+            return -1; // Error: null pointer
+        }
+        
+        // Bounds check on uid to prevent unreasonable values
+        if uid == 0 || uid > 1000000 {
+            return -3; // Error: invalid uid range
+        }
+        
+        unsafe {
+            // Additional safety: check if the pointer seems valid by reading a known field
+            let instance = &mut *instance_ptr;
+            
+            // Basic sanity check: ensure PID is reasonable
+            if instance.pid == 0 || instance.pid > 65535 {
+                return -4; // Error: invalid instance state
+            }
+            
+            match instance.update_request_with_uid(uid) {
+                Ok(()) => 0,  // Success
+                Err(_) => -2, // Error: failed to update request
+            }
+        }
+    }
+    
     pub fn new(pid: u32) -> Result<Self, Box<dyn Error>> {
-        let mut memory_allocator = MemoryAllocator::new(pid, 0x10000)?;
+        let mut memory_allocator = MemoryAllocator::new(pid, MAX_LB_MEMORY_REGION_SIZE)?;
         let var_ptr_sendbuffer = memory_allocator.allocate_var_with_size("SendBuffer", DataType::ByteArray, MAX_LB_SEND_BUFSIZE as usize)?;
         let var_ptr_recvbuffer = memory_allocator.allocate_var_with_size("RecvBuffer", DataType::ByteArray, MAX_LB_RECV_BUFSIZE as usize)?;
         let var_ptr_recvbufsize = memory_allocator.allocate_var("RecvBufSize", DataType::I32)?;
         
         let var_ptr_socket = memory_allocator.allocate_var("Socket", DataType::Pointer)?;
+        let var_ptr_connection_uid = memory_allocator.allocate_var("ConnectionUID", DataType::Pointer)?;
+        let var_ptr_uid = memory_allocator.allocate_var("UID", DataType::I32)?;
+        
+        // Callback infrastructure
+        let var_ptr_self_instance = memory_allocator.allocate_var("SelfInstance", DataType::Pointer)?;
+        let var_ptr_callback_addr = memory_allocator.allocate_var("CallbackAddr", DataType::Pointer)?;
 
         let mut injection_manager = InjectionManager::new(pid);
         injection_manager.add_injection("get_premade".to_string());
         injection_manager.add_injection("ssl_send".to_string());
+        injection_manager.add_injection("command".to_string());
 
         let mut leaderboard_scores = Self {
             pid,
             address_ssl_send: 0,
             address_ssl_recv: 0,
+            address_command: 0,
             address_get_premade: 0,
             injection_manager,
             memory_allocator,
@@ -74,12 +155,16 @@ impl LeaderboardScores {
             var_ptr_recvbuffer,
             var_ptr_recvbufsize,
             var_ptr_socket,
+            var_ptr_connection_uid,
+            var_ptr_uid,
+            var_ptr_self_instance,
+            var_ptr_callback_addr,
             sendbuf_size: MAX_LB_SEND_BUFSIZE,
-            observe_player_count: LB_OPLAYER_COUNT_DEFAULT,
-            leaderboard_type: LeaderboardType::Duels,
+            request_builder: LeaderboardRequestBuilder::new(LeaderboardType::Duels, LB_OPLAYER_COUNT_DEFAULT),
         };
 
         leaderboard_scores.init()?;
+        leaderboard_scores.setup_callback_infrastructure()?;
         leaderboard_scores.set_leaderboard_type(LeaderboardType::Duels)?;
         leaderboard_scores.memory_allocator.write_var("RecvBufSize", MAX_LB_RECV_BUFSIZE)?;
 
@@ -89,6 +174,8 @@ impl LeaderboardScores {
     pub fn init(&mut self) -> Result<(), Box<dyn Error>> {
         let guard = Hashlink::instance(self.pid).lock().unwrap();
         if let Some(hashlink) = guard.as_ref() {
+            const COMMAND_OFFSET: usize = 31; // inc eax; mov [rbp-04],eax
+            self.address_command = hashlink.get_function_address("command", Some(5))? + COMMAND_OFFSET;
             self.address_get_premade = hashlink.get_function_address("get_premade", Some(0))?;
         }
 
@@ -112,6 +199,25 @@ impl LeaderboardScores {
         self.address_ssl_send = addr_ssl_send[0];
         self.address_ssl_recv = addr_ssl_recv[0];
 
+        Ok(())
+    }
+    
+    fn setup_callback_infrastructure(&mut self) -> Result<(), Box<dyn Error>> {
+        // Store the address of the callback function
+        let callback_addr = Self::update_request_callback as *const () as usize;
+        self.memory_allocator.write_var("CallbackAddr", callback_addr)?;
+        
+        // Store pointer to this instance (will be updated when calling from assembly)
+        let self_ptr = self as *const Self as usize;
+        self.memory_allocator.write_var("SelfInstance", self_ptr)?;
+        
+        Ok(())
+    }
+    
+    fn update_request_with_uid(&mut self, uid: u32) -> Result<(), Box<dyn Error>> {
+        let request = self.request_builder.build_request(uid);
+        self.sendbuf_size = request.len() as i32;
+        self.memory_allocator.write_byte_array("SendBuffer", &request)?;
         Ok(())
     }
 
@@ -148,7 +254,7 @@ impl LeaderboardScores {
 
                 1. Call ssl_send
                 2. Call ssl_recv until rax is not 0 or -1 (0xFFFFFFFFFFFFFFFF)
-                3. Everytime ssl_recv is called we need to store 
+                3. Everytime ssl_recv is called we need to store data in the receive buffer
             */
 
             let mut code2 = CodeAssembler::new(64)?;
@@ -162,14 +268,41 @@ impl LeaderboardScores {
             code2.push(r8)?;
             code2.push(r9)?;
             code2.push(r10)?;
+            code2.push(r11)?;
+            code2.push(r12)?;
 
+            // Update `uid` in `mpman.net.Connection` and call Rust callback
+            code2.mov(rbx, self.var_ptr_uid as u64)?;
+            code2.mov(eax, dword_ptr(rbx))?;
+            code2.mov(rbx, self.var_ptr_connection_uid as u64)?;
+            code2.mov(dword_ptr(rbx), eax)?;
+            
+            //
+            // Request buffer
+            //
+
+            // Update instance pointer with current self reference and call callback
+            // Update the instance pointer in memory with current self address
+            code2.mov(r12, self as *const Self as u64)?; // Current instance address
+            code2.mov(rbx, self.var_ptr_self_instance as u64)?;
+            code2.mov(qword_ptr(rbx), r12)?; // Store current instance pointer
+            
+            // Now call the callback with updated pointer
+            code2.mov(rcx, r12)?; // instance pointer in RCX
+            code2.mov(edx, eax)?; // uid value in EDX (32-bit to 32-bit)
+            
+            code2.mov(rbx, self.var_ptr_callback_addr as u64)?;
+            code2.mov(r11, qword_ptr(rbx))?; // callback address in R11
+            code2.call(r11)?; // call the callback
+
+            //
             // ssl/ssl_send@49013 (mbedtls_ssl_context, bytes, i32, i32) -> i32
+            //
 
             code2.mov(rbx, self.var_ptr_socket as u64)?;
             code2.mov(rcx, qword_ptr(rbx))?; // mbedtls_ssl_context
 
-            code2.mov(rdx, self.var_ptr_sendbuffer as u64)?;
-            // code2.mov(rdx, qword_ptr(rbx))?; // bytes
+            code2.mov(rdx, self.var_ptr_sendbuffer as u64)?; // bytes
 
             code2.mov(r8, 0u64)?; // offset
             code2.mov(r9, self.sendbuf_size as u64)?; // length
@@ -180,18 +313,20 @@ impl LeaderboardScores {
             code2.mov(r10, 0u64)?;
             code2.set_label(&mut label_loop)?;
             
+            //
             // ssl/ssl_recv@49012 (mbedtls_ssl_context, bytes, i32, i32) -> i32
-            code2.mov(rbx, self.var_ptr_socket as u64)?;
-            code2.mov(rcx, qword_ptr(rbx))?;
+            //
 
-            code2.mov(rdx, self.var_ptr_recvbuffer as u64)?;
-            // code2.mov(rdx, qword_ptr(rbx))?;
+            code2.mov(rbx, self.var_ptr_socket as u64)?;
+            code2.mov(rcx, qword_ptr(rbx))?; // mbedtls_ssl_context
+
+            code2.mov(rdx, self.var_ptr_recvbuffer as u64)?; // bytes
 
             // TODO: Check if we need to adjust `offset`
-            code2.mov(r8, r10);
+            code2.mov(r8, r10); // offset
 
             code2.mov(rbx, self.var_ptr_recvbufsize as u64)?;
-            code2.mov(r9, qword_ptr(rbx))?;
+            code2.mov(r9, qword_ptr(rbx))?; // length
 
             code2.mov(rax, self.address_ssl_recv as u64)?;
             code2.call(rax)?;
@@ -200,6 +335,8 @@ impl LeaderboardScores {
             code2.cmp(rax, 0)?;
             code2.jg(label_loop)?;
 
+            code2.pop(r12)?;
+            code2.pop(r11)?;
             code2.pop(r10)?;
             code2.pop(r9)?;
             code2.pop(r8)?;
@@ -210,9 +347,39 @@ impl LeaderboardScores {
             code2.popfq()?;
 
             self.injection_manager.apply_injection("get_premade", self.address_get_premade, &mut code2)?;
+
+            /*
+            Injection: command
+
+                1. Obtain `uid` needed for ssl_send requests
+                2. Obtain address of `mpman.net.Connection->uid`
+            */
+
+            let mut code3 = CodeAssembler::new(64)?;
+
+            code3.pushfq()?;
+            code3.push(rax)?;
+            code3.push(rbx)?;
+            code3.push(rcx)?;
+            
+            code3.mov(rbx, self.var_ptr_uid as u64)?;
+            code3.inc(eax)?;
+            code3.mov(dword_ptr(rbx), eax)?;
+
+            code3.mov(rbx, self.var_ptr_connection_uid as u64)?;
+            code3.add(rcx, 0x30)?;
+            code3.mov(qword_ptr(rbx), rcx)?;
+            
+            code3.pop(rcx)?;
+            code3.pop(rbx)?;
+            code3.pop(rax)?;
+            code3.popfq()?;
+
+            self.injection_manager.apply_injection("command", self.address_command, &mut code3)?;
         } else {
-            self.injection_manager.remove_injection("get_premade")?;
             self.injection_manager.remove_injection("ssl_send")?;
+            self.injection_manager.remove_injection("get_premade")?;
+            self.injection_manager.remove_injection("command")?;
         }
 
         self.enabled = enable;
@@ -248,31 +415,11 @@ impl LeaderboardScores {
     }
 
     pub fn set_leaderboard_type(&mut self, lb_type: LeaderboardType) -> Result<(), Box<dyn Error>> {
-        self.leaderboard_type = lb_type;
-
-        // Currently, we support these requests:
-        // 81 7E 00 85 {"uid":46,"args":{"start":0,"v2":true,"count":40,"subrank":0,"season":"NG_RANK_TEAMS_16","game":"northgard"},"cmd":"ranking/getRank"}
-        // 81 7E 00 8A {"uid":45,"args":{"start":0,"v2":true,"count":40,"subrank":0,"season":"NG_RANK_FREEFORALL_16","game":"northgard"},"cmd":"ranking/getRank"}
-        // 81 7E 00 85 {"uid":44,"args":{"start":0,"v2":true,"count":40,"subrank":0,"season":"NG_RANK_DUELS_16","game":"northgard"},"cmd":"ranking/getRank"}
-
-        let (season, uid, header_byte) = match lb_type {
-            LeaderboardType::Duels => ("NG_RANK_DUELS_16", 40, 0x85),
-            LeaderboardType::FreeForAll => ("NG_RANK_FREEFORALL_16", 41, 0x8A),
-            LeaderboardType::Teams => ("NG_RANK_TEAMS_16", 40, 0x85),
-        };
-
-        let json_payload = format!(
-            r#"{{"uid":{},"args":{{"start":0,"v2":true,"count":{},"subrank":0,"season":"{}","game":"northgard"}},"cmd":"ranking/getRank"}}"#,
-            uid, self.observe_player_count, season
-        );
-
-        let mut message = Vec::new();
-        message.extend_from_slice(&[0x81, 0x7E, 0x00, header_byte]);
-        message.extend_from_slice(json_payload.as_bytes());
-
-        self.sendbuf_size = message.len() as i32;
-        self.memory_allocator.write_byte_array("SendBuffer", &message)?;
-
+        self.request_builder = LeaderboardRequestBuilder::new(lb_type, self.request_builder.observe_player_count);
+        
+        let placeholder_uid = 1;
+        self.update_request_with_uid(placeholder_uid)?;
+        
         Ok(())
     }
 
@@ -285,7 +432,13 @@ impl LeaderboardScores {
             return Err(format!("Observable player count cannot exceed {}", MAX_LB_OPLAYER_COUNT).into());
         }
         
-        self.observe_player_count = oplayer_count;
+        // Update the request builder with new player count
+        self.request_builder = LeaderboardRequestBuilder::new(self.request_builder.leaderboard_type, oplayer_count);
+        
+        // Regenerate request with current settings
+        let placeholder_uid = 1;
+        self.update_request_with_uid(placeholder_uid)?;
+        
         Ok(())
     }
 }
