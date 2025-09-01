@@ -196,6 +196,41 @@ impl MemoryAllocator {
         Ok(())
     }
 
+    /// Write byte array to a variable
+    pub fn write_byte_array(&self, name: &str, bytes: &[u8]) -> Result<(), Box<dyn Error>> {
+        let var = self.variables.get(name)
+            .ok_or("Variable not found")?;
+
+        if bytes.len() > var.size {
+            return Err("Byte array too large for allocated variable".into());
+        }
+
+        let handle_wrapper = ProcessHandleWrapper(unsafe {
+            OpenProcess(
+                PROCESS_VM_WRITE | PROCESS_VM_OPERATION,
+                BOOL::from(false),
+                self.pid,
+            )
+        }.map_err(|e| format!("Failed to open process: {:?}", e))?);
+
+        let mut bytes_written = 0;
+        unsafe {
+            WriteProcessMemory(
+                handle_wrapper.0,
+                var.address as *mut _,
+                bytes.as_ptr() as *const c_void,
+                bytes.len(),
+                Some(&mut bytes_written),
+            )
+        }.map_err(|_| "Failed to write memory")?;
+
+        if bytes_written != bytes.len() {
+            return Err("Incomplete write".into());
+        }
+
+        Ok(())
+    }
+
     /// Read value from a variable
     pub fn read_var<T>(&self, name: &str) -> Result<T, Box<dyn Error>> 
     where T: Default + Sized {
