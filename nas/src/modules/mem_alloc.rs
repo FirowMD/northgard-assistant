@@ -1,4 +1,5 @@
-use crate::utils::memory::{MemoryRegion, allocate_region};
+use crate::utils::memory::{MemoryRegion, allocate_region_mrprotect};
+use windows::Win32::System::Memory::PAGE_READWRITE;
 use crate::modules::basic::*;
 use windows::Win32::System::Threading::{OpenProcess, PROCESS_VM_WRITE, PROCESS_VM_OPERATION, PROCESS_VM_READ};
 use windows::Win32::System::Diagnostics::Debug::{WriteProcessMemory, ReadProcessMemory};
@@ -62,7 +63,7 @@ pub struct MemoryAllocator {
 
 impl MemoryAllocator {
     pub fn new(pid: u32, total_size: usize) -> Result<Self, Box<dyn Error>> {
-        let allocated = allocate_region(pid, total_size)?;
+        let allocated = allocate_region_mrprotect(pid, total_size, PAGE_READWRITE)?;
         
         Ok(Self {
             pid,

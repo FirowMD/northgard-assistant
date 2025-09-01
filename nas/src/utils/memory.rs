@@ -125,6 +125,58 @@ pub fn allocate_region(pid: u32, size: usize) -> Result<MemoryRegion, Box<dyn Er
     })
 }
 
+/// Allocate memory region in a process with specified memory protection flags.
+/// 
+/// Returns information about the allocated memory region.
+pub fn allocate_region_mrprotect(pid: u32, size: usize, protection: PAGE_PROTECTION_FLAGS) -> Result<MemoryRegion, Box<dyn Error>> {
+    let handle_wrapper = ProcessHandleWrapper(unsafe {
+        OpenProcess(
+            PROCESS_QUERY_INFORMATION | PROCESS_VM_READ | PROCESS_VM_WRITE | PROCESS_VM_OPERATION,
+            BOOL::from(false),
+            pid,
+        )
+    }.map_err(|e| format!("Failed to open process: {:?}", e))?);
+
+    let address = unsafe {
+        VirtualAllocEx(
+            handle_wrapper.0,
+            None,              // Let the system choose the address
+            size,             // Size of the region
+            MEM_COMMIT | MEM_RESERVE,  // Allocation type
+            protection,        // Memory protection - user specified
+        )
+    };
+
+    if address.is_null() {
+        return Err("Failed to allocate memory region".into());
+    }
+
+    // Query the allocated region to get full information
+    let mut mbi = MEMORY_BASIC_INFORMATION::default();
+    let result = unsafe {
+        VirtualQueryEx(
+            handle_wrapper.0,
+            Some(address),
+            &mut mbi,
+            std::mem::size_of::<MEMORY_BASIC_INFORMATION>(),
+        )
+    };
+
+    if result == 0 {
+        return Err("Failed to query allocated memory region".into());
+    }
+
+    Ok(MemoryRegion {
+        base_address: mbi.BaseAddress as usize,
+        allocation_base: mbi.AllocationBase as usize,
+        allocation_protect: mbi.AllocationProtect.0,
+        region_size: mbi.RegionSize,
+        state: mbi.State.0,
+        protect: mbi.Protect.0,
+        type_: mbi.Type.0,
+    })
+}
+
 /// Enumerate the memory regions of the given process.
 /// 
 /// Returns a list of memory regions.
