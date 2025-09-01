@@ -13,6 +13,7 @@ use crate::modules::lobby_members::LobbyMembers;
 use crate::modules::auto_lockin::AutoLockin;
 use crate::modules::game_common::GameCommon;
 use crate::modules::build_guide::{BuildGuideManager};
+use crate::modules::leaderboard_scores::{LeaderboardScores, LeaderboardType};
 use crate::core::building_window::BuildingWindow;
 use crate::core::lore_window::LoreWindow;
 use crate::core::warband_window::WarbandWindow;
@@ -79,6 +80,11 @@ pub struct MainWindow {
     warband_window: Option<WarbandWindow>,
     build_guide_manager: Option<BuildGuideManager>,
     selected_guide: Option<String>,
+    leaderboard_scores: Option<LeaderboardScores>,
+    leaderboard_enabled: bool,
+    leaderboard_observe_count: i32,
+    leaderboard_selected_type: usize,
+    leaderboard_buffer_text: String,
 }
 
 impl MainWindow {
@@ -100,6 +106,11 @@ impl MainWindow {
             warband_window: None,
             build_guide_manager: None,
             selected_guide: None,
+            leaderboard_scores: None,
+            leaderboard_enabled: false,
+            leaderboard_observe_count: 40,
+            leaderboard_selected_type: 0,
+            leaderboard_buffer_text: String::new(),
         }
     }
 
@@ -203,6 +214,17 @@ impl ImguiRenderLoop for MainWindow {
         self.lobby_members = Some(LobbyMembers::new(self.pid).unwrap());
         self.building_window = Some(BuildingWindow::new());
         self.warband_window = Some(WarbandWindow::new());
+        
+        // Initialize LeaderboardScores
+        match LeaderboardScores::new(self.pid) {
+            Ok(leaderboard_scores) => {
+                self.leaderboard_scores = Some(leaderboard_scores);
+                tracing::info!("Successfully initialized LeaderboardScores");
+            }
+            Err(e) => {
+                tracing::error!("Failed to initialize LeaderboardScores: {}", e);
+            }
+        }
     }
 
     fn render(&mut self, ui: &mut imgui::Ui) {
@@ -372,91 +394,189 @@ impl ImguiRenderLoop for MainWindow {
                     }
 
                     if let Some(manager) = &self.build_guide_manager {
-                        let guide_names = manager.get_guide_names();
-                        let combo_text = self.selected_guide
-                            .as_deref()
-                            .unwrap_or("Select build guide");
-                            
-                        if let Some(token) = ui.begin_combo("Build Guide", combo_text) {
-                            for guide_name in &guide_names {
-                                let is_selected = Some(guide_name) == self.selected_guide.as_ref();
+                        ui.separator();
+                        
+                        if ui.collapsing_header("Build Guide", imgui::TreeNodeFlags::empty()) {
+                            let guide_names = manager.get_guide_names();
+                            let combo_text = self.selected_guide
+                                .as_deref()
+                                .unwrap_or("Select build guide");
                                 
-                                if ui.selectable_config(guide_name)
-                                    .selected(is_selected)
-                                    .build() 
-                                {
-                                    self.selected_guide = Some(guide_name.clone());
+                            if let Some(token) = ui.begin_combo("##build_guide_combo", combo_text) {
+                                for guide_name in &guide_names {
+                                    let is_selected = Some(guide_name) == self.selected_guide.as_ref();
                                     
-                                    // If a guide is selected, update clan and lores
-                                    if let Some(guide) = manager.get_guide(guide_name) {
-                                        if let Some(auto_lockin) = &mut self.auto_lockin {
-                                            // Set clan
-                                            if let Some(clans) = auto_lockin.get_clans_game() {
-                                                if let Some(clan_idx) = clans.iter().position(|c| c == &guide.clan) {
-                                                    self.selected_clan = Some(clan_idx);
-                                                    if let Err(e) = auto_lockin.auto_lockin_apply_clan(true, &guide.clan) {
-                                                        tracing::error!("Failed to set clan: {}", e);
+                                    if ui.selectable_config(guide_name)
+                                        .selected(is_selected)
+                                        .build() 
+                                    {
+                                        self.selected_guide = Some(guide_name.clone());
+                                        
+                                        // If a guide is selected, update clan and lores
+                                        if let Some(guide) = manager.get_guide(guide_name) {
+                                            if let Some(auto_lockin) = &mut self.auto_lockin {
+                                                // Set clan
+                                                if let Some(clans) = auto_lockin.get_clans_game() {
+                                                    if let Some(clan_idx) = clans.iter().position(|c| c == &guide.clan) {
+                                                        self.selected_clan = Some(clan_idx);
+                                                        if let Err(e) = auto_lockin.auto_lockin_apply_clan(true, &guide.clan) {
+                                                            tracing::error!("Failed to set clan: {}", e);
+                                                        }
                                                     }
                                                 }
+                                                
+                                                // TODO: Add lore order display/tracking
                                             }
-                                            
-                                            // TODO: Add lore order display/tracking
                                         }
                                     }
                                 }
+                                token.end();
                             }
-                            token.end();
-                        }
-                        
-                        // Display current guide info if selected
-                        if let Some(guide_name) = &self.selected_guide {
-                            if let Some(guide) = manager.get_guide(guide_name) {
-                                ui.separator();
-                                
-                                if ui.collapsing_header("Guide Info", imgui::TreeNodeFlags::empty()) {
+                            
+                            // Display current guide info if selected
+                            if let Some(guide_name) = &self.selected_guide {
+                                if let Some(guide) = manager.get_guide(guide_name) {
+                                    ui.separator();
+                                    
                                     // Display clan
                                     ui.text(format!("Clan: {}", guide.clan));
                                     
-                                    // Display lore order
-                                    if let Some(token) = ui.tree_node("Lore Order") {
-                                        for (i, lore) in guide.lore_order.iter().enumerate() {
-                                            ui.text(format!("{}. {}", i + 1, lore));
-                                        }
-                                        token.end();
+                                    // Display lore order in a child window to limit height
+                                    if ui.collapsing_header("Lore Order", imgui::TreeNodeFlags::empty()) {
+                                        ui.child_window("lore_order")
+                                            .size([0.0, 100.0])
+                                            .border(true)
+                                            .build(|| {
+                                                for (i, lore) in guide.lore_order.iter().enumerate() {
+                                                    ui.text(format!("{}. {}", i + 1, lore));
+                                                }
+                                            });
                                     }
                                     
-                                    // Display groups
-                                    if let Some(token) = ui.tree_node("Groups") {
-                                        for (year, group) in &guide.groups {
-                                            if let Some(year_token) = ui.tree_node(year) {
-                                                // Buildings
-                                                if !group.buildings.is_empty() {
-                                                    ui.text("Buildings:");
-                                                    for building in &group.buildings {
-                                                        ui.bullet_text(building);
+                                    // Display groups in a child window to limit height
+                                    if ui.collapsing_header("Groups", imgui::TreeNodeFlags::empty()) {
+                                        ui.child_window("groups_info")
+                                            .size([0.0, 200.0])
+                                            .border(true)
+                                            .build(|| {
+                                                for (year, group) in &guide.groups {
+                                                    if let Some(year_token) = ui.tree_node(year) {
+                                                        // Buildings
+                                                        if !group.buildings.is_empty() {
+                                                            ui.text("Buildings:");
+                                                            for building in &group.buildings {
+                                                                ui.bullet_text(building);
+                                                            }
+                                                        }
+                                                        
+                                                        // Units
+                                                        if !group.units.is_empty() {
+                                                            ui.text("Units:");
+                                                            for unit in &group.units {
+                                                                ui.bullet_text(unit);
+                                                            }
+                                                        }
+                                                        
+                                                        // Description
+                                                        if !group.description.is_empty() {
+                                                            ui.text_wrapped(&group.description);
+                                                        }
+                                                        
+                                                        year_token.end();
                                                     }
                                                 }
-                                                
-                                                // Units
-                                                if !group.units.is_empty() {
-                                                    ui.text("Units:");
-                                                    for unit in &group.units {
-                                                        ui.bullet_text(unit);
-                                                    }
-                                                }
-                                                
-                                                // Description
-                                                if !group.description.is_empty() {
-                                                    ui.text_wrapped(&group.description);
-                                                }
-                                                
-                                                year_token.end();
-                                            }
-                                        }
-                                        token.end();
+                                            });
                                     }
                                 }
                             }
+                        }
+                    }
+
+                    ui.separator();
+                    
+                    if ui.collapsing_header("Leaderboard Scores", imgui::TreeNodeFlags::empty()) {
+                        if let Some(leaderboard) = &mut self.leaderboard_scores {
+                            if ui.checkbox("Enable Leaderboard Scores", &mut self.leaderboard_enabled) {
+                                if let Err(e) = leaderboard.apply(self.leaderboard_enabled) {
+                                    tracing::error!("Failed to toggle leaderboard: {}", e);
+                                    self.leaderboard_enabled = !self.leaderboard_enabled;
+                                } else {
+                                    tracing::info!("Leaderboard {}", if self.leaderboard_enabled { "enabled" } else { "disabled" });
+                                }
+                            }
+
+                            if self.leaderboard_enabled {
+                                // InputInt for observe_player_count
+                                ui.text("Observe Player Count:");
+                                let mut observe_count = self.leaderboard_observe_count;
+                                if ui.input_int("##observe_count", &mut observe_count).build() {
+                                    if observe_count > 0 && observe_count <= 2000 {
+                                        self.leaderboard_observe_count = observe_count;
+                                        if let Err(e) = leaderboard.set_observable_player_count(observe_count) {
+                                            tracing::error!("Failed to set observe count: {}", e);
+                                        }
+                                    }
+                                }
+                                ui.same_line();
+                                ui.text_disabled("(1-2000)");
+                                
+                                // Combo for leaderboard_type
+                                let leaderboard_types = ["Duels", "FreeForAll", "Teams"];
+                                let combo_text = leaderboard_types[self.leaderboard_selected_type];
+                                
+                                if let Some(token) = ui.begin_combo("Leaderboard Type", combo_text) {
+                                    for (idx, lb_type) in leaderboard_types.iter().enumerate() {
+                                        let is_selected = idx == self.leaderboard_selected_type;
+                                        
+                                        if ui.selectable_config(lb_type).selected(is_selected).build() {
+                                            self.leaderboard_selected_type = idx;
+                                            let lb_type = match idx {
+                                                0 => LeaderboardType::Duels,
+                                                1 => LeaderboardType::FreeForAll,
+                                                2 => LeaderboardType::Teams,
+                                                _ => LeaderboardType::Duels,
+                                            };
+                                            if let Err(e) = leaderboard.set_leaderboard_type(lb_type) {
+                                                tracing::error!("Failed to set leaderboard type: {}", e);
+                                            }
+                                        }
+                                    }
+                                    token.end();
+                                }
+                                
+                                ui.separator();
+                                
+                                // Button to get receive buffer
+                                if ui.button("Get Receive Buffer") {
+                                    match leaderboard.get_recv_buffer() {
+                                        Ok(buffer) => {
+                                            self.leaderboard_buffer_text = String::from_utf8_lossy(&buffer).to_string();
+                                            tracing::info!("Retrieved {} bytes from receive buffer", buffer.len());
+                                        }
+                                        Err(e) => {
+                                            self.leaderboard_buffer_text = format!("Error: {}", e);
+                                            tracing::error!("Failed to get receive buffer: {}", e);
+                                        }
+                                    }
+                                }
+                                
+                                // Display receive buffer in a child window
+                                ui.child_window("leaderboard_buffer")
+                                    .size([0.0, 150.0])
+                                    .border(true)
+                                    .build(|| {
+                                        if self.leaderboard_buffer_text.is_empty() {
+                                            ui.text_disabled("Click 'Get Receive Buffer' to see leaderboard data");
+                                        } else {
+                                            ui.text_wrapped(&self.leaderboard_buffer_text);
+                                        }
+                                    });
+                            } else {
+                                ui.text_disabled("Enable leaderboard scores to see options");
+                            }
+                        } else {
+                            ui.text_colored([1.0, 0.5, 0.5, 1.0], "Leaderboard Scores failed to initialize");
+                            ui.text_disabled("Check logs for initialization errors");
                         }
                     }
                 });

@@ -1,27 +1,24 @@
 /*
-    Injects to ssl_new and get_premade.
-    - ssl_new - to obtain socket handle
+    Injects to ssl_send and get_premade.
+    - ssl_send - to obtain socket handle
     - get_premade - to execute our code, which will receive actual player ranks
 */
 
-use crate::modules::base::{Command, CommandContext, InjectionManager, aob_scan_mrprotect};
+use crate::modules::base::InjectionManager;
 use crate::modules::mem_alloc::{MemoryAllocator, DataType};
 use crate::modules::hashlink::*;
-use crate::utils::memory::{read_bytes, write_byte};
+use crate::modules::basic::aob_scan_mrprotect;
 use windows::Win32::System::Threading::{OpenProcess, PROCESS_VM_READ};
 use windows::Win32::System::Diagnostics::Debug::ReadProcessMemory;
 use windows::Win32::System::Memory::{PAGE_EXECUTE, PAGE_EXECUTE_READ, PAGE_EXECUTE_READWRITE};
 use windows::Win32::Foundation::BOOL;
 use iced_x86::code_asm::*;
 use std::error::Error;
-use std::collections::HashMap;
-use std::sync::Mutex;
-use windows::Win32::Foundation::HANDLE;
 
-const MAX_LB_SEND_BUFSIZE: usize = 0x1000;
-const MAX_LB_RECV_BUFSIZE: usize = 0x5000;
-const MAX_LB_OPLAYER_COUNT: usize = 0x2000;
-const LB_OPLAYER_COUNT_DEFAULT: usize = 40;
+const MAX_LB_SEND_BUFSIZE: i32 = 0x1000;
+const MAX_LB_RECV_BUFSIZE: i32 = 0x5000;
+const MAX_LB_OPLAYER_COUNT: i32 = 0x2000;
+const LB_OPLAYER_COUNT_DEFAULT: i32 = 40;
 
 #[derive(Clone, Copy)]
 pub enum LeaderboardType {
@@ -34,7 +31,6 @@ pub struct LeaderboardScores {
     pid: u32,
     address_ssl_send: usize,
     address_ssl_recv: usize,
-    address_ssl_new: usize,
     address_get_premade: usize,
     injection_manager: InjectionManager,
     memory_allocator: MemoryAllocator,
@@ -46,7 +42,7 @@ pub struct LeaderboardScores {
     var_ptr_recvbufsize: usize,
     var_ptr_socket: usize,
 
-    sendbuf_size: usize,
+    sendbuf_size: i32,
     
     // Adjustable by user
     observe_player_count: i32,
@@ -56,21 +52,20 @@ pub struct LeaderboardScores {
 impl LeaderboardScores {
     pub fn new(pid: u32) -> Result<Self, Box<dyn Error>> {
         let mut memory_allocator = MemoryAllocator::new(pid, 0x10000)?;
-        let var_ptr_sendbuffer = memory_allocator.allocate_var_with_size("SendBuffer", DataType::ByteArray, MAX_LB_SEND_BUFSIZE)?;
-        let var_ptr_recvbuffer = memory_allocator.allocate_var_with_size("RecvBuffer", DataType::ByteArray, MAX_LB_RECV_BUFSIZE)?;
+        let var_ptr_sendbuffer = memory_allocator.allocate_var_with_size("SendBuffer", DataType::ByteArray, MAX_LB_SEND_BUFSIZE as usize)?;
+        let var_ptr_recvbuffer = memory_allocator.allocate_var_with_size("RecvBuffer", DataType::ByteArray, MAX_LB_RECV_BUFSIZE as usize)?;
         let var_ptr_recvbufsize = memory_allocator.allocate_var("RecvBufSize", DataType::I32)?;
         
         let var_ptr_socket = memory_allocator.allocate_var("Socket", DataType::Pointer)?;
 
         let mut injection_manager = InjectionManager::new(pid);
         injection_manager.add_injection("get_premade".to_string());
-        injection_manager.add_injection("ssl_new".to_string());
+        injection_manager.add_injection("ssl_send".to_string());
 
         let mut leaderboard_scores = Self {
             pid,
             address_ssl_send: 0,
             address_ssl_recv: 0,
-            address_ssl_new: 0,
             address_get_premade: 0,
             injection_manager,
             memory_allocator,
@@ -86,7 +81,7 @@ impl LeaderboardScores {
 
         leaderboard_scores.init()?;
         leaderboard_scores.set_leaderboard_type(LeaderboardType::Duels)?;
-        memory_allocator.write_var("RecvBufSize", MAX_LB_RECV_BUFSIZE)?;
+        leaderboard_scores.memory_allocator.write_var("RecvBufSize", MAX_LB_RECV_BUFSIZE)?;
 
         Ok(leaderboard_scores)
     }
@@ -99,7 +94,6 @@ impl LeaderboardScores {
 
         let hex_pattern_ssl_send = "48 83 ?? ?? 49 63 ?? 48 03 ?? 4D ?? ?? E8 ?? ?? ?? ?? 85";
         let hex_pattern_ssl_recv = "48 83 ?? ?? 49 63 ?? 48 03 ?? 4D ?? ?? E8 ?? ?? ?? ?? 3D";
-        let hex_pattern_ssl_new = "48 89 ?? ?? ?? 57 48 83 ?? ?? 48 8B ?? BA ?? ?? ?? ?? 48 8B ?? ?? ?? ?? ?? 41 ?? ?? ?? ?? ?? FF ?? ?? ?? ?? ?? 33 ?? 41 ?? ?? ?? ?? ?? 48 8B ?? 48 8B ?? E8 ?? ?? ?? ?? 48 8B ?? 48 8B ?? E8 ?? ?? ?? ?? 8B ?? 85 ?? 75 ?? 48 8B ?? ?? ?? 48 8B ?? 48 83 ?? ?? 5F C3 48 8B ?? E8 ?? ?? ?? ?? 8B ?? E8 ?? ?? ?? ??";
 
         let executable_protection = PAGE_EXECUTE.0 | PAGE_EXECUTE_READ.0 | PAGE_EXECUTE_READWRITE.0;
 
@@ -113,111 +107,116 @@ impl LeaderboardScores {
             return Err("Pattern not found: ssl_recv".into());
         }
 
-        let addr_ssl_new = aob_scan_mrprotect(self.pid, hex_pattern_ssl_new, executable_protection)?;
-        if addr_ssl_new.is_empty() {
-            return Err("Pattern not found: ssl_new".into());
-        }
-
         const SSL_NEW_RET_OFFSET: usize = 86;
 
         self.address_ssl_send = addr_ssl_send[0];
         self.address_ssl_recv = addr_ssl_recv[0];
-        self.address_ssl_new = addr_ssl_new[0] + SSL_NEW_RET_OFFSET;
 
         Ok(())
     }
 
-    pub fn apply(&mut self) -> Result<(), Box<dyn Error>> {
-        /*
-        Injection: ssl_new
+    pub fn apply(&mut self, enable: bool) -> Result<(), Box<dyn Error>> {
+        if enable {
+            /*
+            Injection: ssl_send
 
-            1. Just put result of ssl_new into our variable (socket handle)
-        */
-        self.injection_manager.remove_injection("get_premade")?;
-        self.injection_manager.remove_injection("ssl_new")?;
+                1. Check if rdx[0] == 0x81
+                2. If so, update socket handle
+            */
+            let mut code = CodeAssembler::new(64)?;
+            let mut label_sslsend = code.create_label();
 
-        let mut code = CodeAssembler::new(64)?;
+            code.pushfq()?;
+            code.push(rbx)?;
+            code.push(rcx)?;
 
-        code.pushfq()?;
-        code.push(rax)?;
-        code.push(rbx)?;
+            code.cmp(byte_ptr(rdx), 0x81)?;
+            code.jne(label_sslsend)?;
 
-        code.mov(rbx, self.var_ptr_socket as u64)?;
-        code.mov(qword_ptr(rbx), rax)?;
+            code.mov(rbx, self.var_ptr_socket as u64)?;
+            code.mov(qword_ptr(rbx), rcx)?;
 
-        code.pop(rbx)?;
-        code.pop(rax)?;
-        code.popfq()?;
+            code.set_label(&mut label_sslsend)?;
+            code.pop(rcx)?;
+            code.pop(rbx)?;
+            code.popfq()?;
 
-        self.injection_manager.apply_injection("ssl_new", self.address_ssl_new, &mut code)?;
+            self.injection_manager.apply_injection("ssl_send", self.address_ssl_send, &mut code)?;
 
-        /*
-        Injection: get_premade
+            /*
+            Injection: get_premade
 
-            1. Call ssl_send
-            2. Call ssl_recv until rax is not 0 or -1 (0xFFFFFFFFFFFFFFFF)
-            3. Everytime ssl_recv is called we need to store 
-        */
+                1. Call ssl_send
+                2. Call ssl_recv until rax is not 0 or -1 (0xFFFFFFFFFFFFFFFF)
+                3. Everytime ssl_recv is called we need to store 
+            */
 
-        let mut code2 = CodeAssembler::new(64)?;
-        let mut label_loop = code2.create_label();
+            let mut code2 = CodeAssembler::new(64)?;
+            let mut label_loop = code2.create_label();
 
-        code2.pushfq()?;
-        code2.push(rax)?;
-        code2.push(rbx)?;
-        code2.push(rcx)?;
-        code2.push(rdx)?;
-        code2.push(r8)?;
-        code2.push(r9)?;
-        code2.push(r10)?;
+            code2.pushfq()?;
+            code2.push(rax)?;
+            code2.push(rbx)?;
+            code2.push(rcx)?;
+            code2.push(rdx)?;
+            code2.push(r8)?;
+            code2.push(r9)?;
+            code2.push(r10)?;
 
-        // ssl/ssl_send@49013 (mbedtls_ssl_context, bytes, i32, i32) -> i32
+            // ssl/ssl_send@49013 (mbedtls_ssl_context, bytes, i32, i32) -> i32
 
-        code2.mov(rbx, self.var_ptr_socket as u64)?;
-        code2.mov(rcx, qword_ptr(rbx))?; // mbedtls_ssl_context
+            code2.mov(rbx, self.var_ptr_socket as u64)?;
+            code2.mov(rcx, qword_ptr(rbx))?; // mbedtls_ssl_context
 
-        code2.mov(rbx, self.var_ptr_sendbuffer as u64)?;
-        code2.mov(rdx, qword_ptr(rbx))?; // bytes
+            code2.mov(rdx, self.var_ptr_sendbuffer as u64)?;
+            // code2.mov(rdx, qword_ptr(rbx))?; // bytes
 
-        code2.mov(r8, 0)?; // offset
-        code2.mov(r9, self.sendbuf_size)?; // length
+            code2.mov(r8, 0u64)?; // offset
+            code2.mov(r9, self.sendbuf_size as u64)?; // length
 
-        code2.mov(rax, self.address_ssl_send as u64)?;
-        code2.call(rax)?;
+            code2.mov(rax, self.address_ssl_send as u64)?;
+            code2.call(rax)?;
 
-        code2.mov(r10, 0)?;
-        code2.set_label(&mut label_loop)?;
-        
-        // ssl/ssl_recv@49012 (mbedtls_ssl_context, bytes, i32, i32) -> i32
-        code2.mov(rbx, self.var_ptr_socket as u64)?;
-        code2.mov(rcx, qword_ptr(rbx))?;
+            code2.mov(r10, 0u64)?;
+            code2.set_label(&mut label_loop)?;
+            
+            // ssl/ssl_recv@49012 (mbedtls_ssl_context, bytes, i32, i32) -> i32
+            code2.mov(rbx, self.var_ptr_socket as u64)?;
+            code2.mov(rcx, qword_ptr(rbx))?;
 
-        code2.mov(rbx, self.var_ptr_recvbuffer as u64)?;
-        code2.mov(rdx, qword_ptr(rbx))?;
+            code2.mov(rdx, self.var_ptr_recvbuffer as u64)?;
+            // code2.mov(rdx, qword_ptr(rbx))?;
 
-        //! Check if we need to adjust `offset`
-        code2.mov(r8, r10);
+            // TODO: Check if we need to adjust `offset`
+            code2.mov(r8, r10);
 
-        code2.mov(rbx, self.var_ptr_recvbufsize)?;
-        code2.mov(r9, qword_ptr(rbx))?;
+            code2.mov(rbx, self.var_ptr_recvbufsize as u64)?;
+            code2.mov(r9, qword_ptr(rbx))?;
 
-        code2.mov(rax, self.address_ssl_recv)?;
-        code2.call(rax)?;
+            code2.mov(rax, self.address_ssl_recv as u64)?;
+            code2.call(rax)?;
 
-        code2.add(r10, rax)?;
-        code2.cmp(rax, 0)?;
-        code2.jg(label_loop)?;
+            code2.add(r10, rax)?;
+            code2.cmp(rax, 0)?;
+            code2.jg(label_loop)?;
 
-        code2.pop(r10)?;
-        code2.pop(r9)?;
-        code2.pop(r8)?;
-        code2.pop(rdx)?;
-        code2.pop(rcx)?;
-        code2.pop(rbx)?;
-        code2.pop(rax)?;
-        code2.popfq()?;
+            code2.pop(r10)?;
+            code2.pop(r9)?;
+            code2.pop(r8)?;
+            code2.pop(rdx)?;
+            code2.pop(rcx)?;
+            code2.pop(rbx)?;
+            code2.pop(rax)?;
+            code2.popfq()?;
 
-        self.injection_manager.apply_injection("get_premade", self.address_get_premade, &mut code2)?;
+            self.injection_manager.apply_injection("get_premade", self.address_get_premade, &mut code2)?;
+        } else {
+            self.injection_manager.remove_injection("get_premade")?;
+            self.injection_manager.remove_injection("ssl_send")?;
+        }
+
+        self.enabled = enable;
+        Ok(())
     }
 
     pub fn get_recv_buffer(&self) -> Result<Vec<u8>, Box<dyn Error>> {
@@ -229,7 +228,7 @@ impl LeaderboardScores {
             )
         }.map_err(|e| format!("Failed to open process: {:?}", e))?;
 
-        let mut buffer = vec![0u8; MAX_LB_RECV_BUFSIZE];
+        let mut buffer = vec![0u8; MAX_LB_RECV_BUFSIZE as usize];
         let mut bytes_read = 0;
         
         unsafe {
@@ -237,7 +236,7 @@ impl LeaderboardScores {
                 handle,
                 self.var_ptr_recvbuffer as *const _,
                 buffer.as_mut_ptr() as *mut _,
-                MAX_LB_RECV_BUFSIZE,
+                MAX_LB_RECV_BUFSIZE as usize,
                 Some(&mut bytes_read),
             )
         }.map_err(|_| "Failed to read receive buffer")?;
@@ -257,9 +256,9 @@ impl LeaderboardScores {
         // 81 7E 00 85 {"uid":44,"args":{"start":0,"v2":true,"count":40,"subrank":0,"season":"NG_RANK_DUELS_16","game":"northgard"},"cmd":"ranking/getRank"}
 
         let (season, uid, header_byte) = match lb_type {
-            LeaderboardType::Duels => ("NG_RANK_DUELS_16", 44, 0x85),
-            LeaderboardType::FreeForAll => ("NG_RANK_FREEFORALL_16", 45, 0x8A),
-            LeaderboardType::Teams => ("NG_RANK_TEAMS_16", 46, 0x85),
+            LeaderboardType::Duels => ("NG_RANK_DUELS_16", 40, 0x85),
+            LeaderboardType::FreeForAll => ("NG_RANK_FREEFORALL_16", 41, 0x8A),
+            LeaderboardType::Teams => ("NG_RANK_TEAMS_16", 40, 0x85),
         };
 
         let json_payload = format!(
@@ -271,7 +270,7 @@ impl LeaderboardScores {
         message.extend_from_slice(&[0x81, 0x7E, 0x00, header_byte]);
         message.extend_from_slice(json_payload.as_bytes());
 
-        self.sendbuf_size = message.len();
+        self.sendbuf_size = message.len() as i32;
         self.memory_allocator.write_byte_array("SendBuffer", &message)?;
 
         Ok(())
