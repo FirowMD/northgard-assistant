@@ -1,15 +1,15 @@
 /*
-    Injects to ssl_send and get_premade.
+    Injects to ssl_send and getModes.
     - ssl_send - to obtain socket handle
-    - get_premade - to execute our code, which will receive actual player ranks
+    - getModes - to execute our code, which will receive actual player ranks
 */
 
 use crate::modules::base::InjectionManager;
 use crate::modules::mem_alloc::{MemoryAllocator, DataType};
 use crate::modules::hashlink::*;
 use crate::modules::basic::aob_scan_mrprotect;
-use windows::Win32::System::Threading::{OpenProcess, PROCESS_VM_READ};
-use windows::Win32::System::Diagnostics::Debug::ReadProcessMemory;
+use windows::Win32::System::Threading::{OpenProcess, PROCESS_VM_READ, PROCESS_VM_WRITE, PROCESS_VM_OPERATION};
+use windows::Win32::System::Diagnostics::Debug::{ReadProcessMemory, WriteProcessMemory};
 use windows::Win32::System::Memory::{PAGE_EXECUTE, PAGE_EXECUTE_READ, PAGE_EXECUTE_READWRITE};
 use windows::Win32::Foundation::BOOL;
 use iced_x86::code_asm::*;
@@ -70,8 +70,8 @@ pub struct LeaderboardScores {
 
     // fn command@11808 (mpman.net.Connection, String, dynamic) -> mpman.Promise (22 regs, 45 ops)
     address_command: usize,
-    // fn get_premade@30686 (ui.menus.multiplayer.LobbyFinderForm) -> mpman.Lobby (4 regs, 10 ops)
-    address_get_premade: usize,
+    // fn getModes@30686 (ui.menus.multiplayer.LobbyFinderForm) -> mpman.Lobby (4 regs, 10 ops)
+    address_getmodes: usize,
     
     injection_manager: InjectionManager,
     memory_allocator: MemoryAllocator,
@@ -95,30 +95,23 @@ pub struct LeaderboardScores {
 }
 
 impl LeaderboardScores {
-    // Callback function that can be called from assembly code
-    // Safety: This function is called from injected assembly code with proper arguments
-    extern "C" fn update_request_callback(instance_ptr: *mut LeaderboardScores, uid: u32) -> i32 {
-        if instance_ptr.is_null() {
-            return -1; // Error: null pointer
-        }
-        
-        // Bounds check on uid to prevent unreasonable values
+    // Called from the `getModes` injection
+    // Updates uid in request
+    extern "win64" fn update_request_callback(instance_ptr: *mut LeaderboardScores, uid: u32) -> i32 {
         if uid == 0 || uid > 1000000 {
-            return -3; // Error: invalid uid range
+            return -3;
         }
         
         unsafe {
-            // Additional safety: check if the pointer seems valid by reading a known field
             let instance = &mut *instance_ptr;
             
-            // Basic sanity check: ensure PID is reasonable
             if instance.pid == 0 || instance.pid > 65535 {
-                return -4; // Error: invalid instance state
+                return -4;
             }
             
             match instance.update_request_with_uid(uid) {
-                Ok(()) => 0,  // Success
-                Err(_) => -2, // Error: failed to update request
+                Ok(()) => 0,
+                Err(_) => -2,
             }
         }
     }
@@ -138,7 +131,7 @@ impl LeaderboardScores {
         let var_ptr_callback_addr = memory_allocator.allocate_var("CallbackAddr", DataType::Pointer)?;
 
         let mut injection_manager = InjectionManager::new(pid);
-        injection_manager.add_injection("get_premade".to_string());
+        injection_manager.add_injection("getModes".to_string());
         injection_manager.add_injection("ssl_send".to_string());
         injection_manager.add_injection("command".to_string());
 
@@ -147,7 +140,7 @@ impl LeaderboardScores {
             address_ssl_send: 0,
             address_ssl_recv: 0,
             address_command: 0,
-            address_get_premade: 0,
+            address_getmodes: 0,
             injection_manager,
             memory_allocator,
             enabled: false,
@@ -176,7 +169,7 @@ impl LeaderboardScores {
         if let Some(hashlink) = guard.as_ref() {
             const COMMAND_OFFSET: usize = 31; // inc eax; mov [rbp-04],eax
             self.address_command = hashlink.get_function_address("command", Some(5))? + COMMAND_OFFSET;
-            self.address_get_premade = hashlink.get_function_address("get_premade", Some(0))?;
+            self.address_getmodes = hashlink.get_function_address("getModes", Some(0))?;
         }
 
         let hex_pattern_ssl_send = "48 83 ?? ?? 49 63 ?? 48 03 ?? 4D ?? ?? E8 ?? ?? ?? ?? 85";
@@ -217,7 +210,31 @@ impl LeaderboardScores {
     fn update_request_with_uid(&mut self, uid: u32) -> Result<(), Box<dyn Error>> {
         let request = self.request_builder.build_request(uid);
         self.sendbuf_size = request.len() as i32;
-        self.memory_allocator.write_byte_array("SendBuffer", &request)?;
+        
+        // Direct WriteProcessMemory instead of going through memory_allocator
+        let handle = unsafe {
+            OpenProcess(
+                PROCESS_VM_WRITE | PROCESS_VM_OPERATION,
+                BOOL::from(false),
+                self.pid,
+            )
+        }.map_err(|e| format!("Failed to open process: {:?}", e))?;
+        
+        let result = unsafe {
+            WriteProcessMemory(
+                handle,
+                self.var_ptr_sendbuffer as *mut _,
+                request.as_ptr() as *const _,
+                request.len(),
+                None,
+            )
+        };
+        
+        // Uncommenting this crashes the game
+        // unsafe { let _ = windows::Win32::Foundation::CloseHandle(handle); }
+        
+        result.map_err(|_| "Failed to write request to SendBuffer")?;
+        
         Ok(())
     }
 
@@ -250,7 +267,7 @@ impl LeaderboardScores {
             self.injection_manager.apply_injection("ssl_send", self.address_ssl_send, &mut code)?;
 
             /*
-            Injection: get_premade
+            Injection: getModes
 
                 1. Call ssl_send
                 2. Call ssl_recv until rax is not 0 or -1 (0xFFFFFFFFFFFFFFFF)
@@ -260,6 +277,8 @@ impl LeaderboardScores {
             let mut code2 = CodeAssembler::new(64)?;
             let mut label_loop = code2.create_label();
 
+            code2.push(rbp)?;
+            code2.mov(rbp, rsp)?;
             code2.pushfq()?;
             code2.push(rax)?;
             code2.push(rbx)?;
@@ -293,7 +312,9 @@ impl LeaderboardScores {
             
             code2.mov(rbx, self.var_ptr_callback_addr as u64)?;
             code2.mov(r11, qword_ptr(rbx))?; // callback address in R11
+            code2.sub(rsp, 0x20)?;
             code2.call(r11)?; // call the callback
+            code2.add(rsp, 0x20)?;
 
             //
             // ssl/ssl_send@49013 (mbedtls_ssl_context, bytes, i32, i32) -> i32
@@ -308,7 +329,9 @@ impl LeaderboardScores {
             code2.mov(r9, self.sendbuf_size as u64)?; // length
 
             code2.mov(rax, self.address_ssl_send as u64)?;
+            code2.sub(rsp, 0x20)?;
             code2.call(rax)?;
+            code2.add(rsp, 0x20)?;
 
             code2.mov(r10, 0u64)?;
             code2.set_label(&mut label_loop)?;
@@ -323,16 +346,18 @@ impl LeaderboardScores {
             code2.mov(rdx, self.var_ptr_recvbuffer as u64)?; // bytes
 
             // TODO: Check if we need to adjust `offset`
-            code2.mov(r8, r10); // offset
+            code2.mov(r8, 0u64)?; // data collected is stored in r10
 
             code2.mov(rbx, self.var_ptr_recvbufsize as u64)?;
             code2.mov(r9, qword_ptr(rbx))?; // length
 
             code2.mov(rax, self.address_ssl_recv as u64)?;
+            code2.sub(rsp, 0x20)?;
             code2.call(rax)?;
+            code2.add(rsp, 0x20)?;
 
             code2.add(r10, rax)?;
-            code2.cmp(rax, 0)?;
+            code2.cmp(eax, 0)?;
             code2.jg(label_loop)?;
 
             code2.pop(r12)?;
@@ -345,8 +370,9 @@ impl LeaderboardScores {
             code2.pop(rbx)?;
             code2.pop(rax)?;
             code2.popfq()?;
+            code2.pop(rbp)?;
 
-            self.injection_manager.apply_injection("get_premade", self.address_get_premade, &mut code2)?;
+            self.injection_manager.apply_injection("getModes", self.address_getmodes, &mut code2)?;
 
             /*
             Injection: command
@@ -378,7 +404,7 @@ impl LeaderboardScores {
             self.injection_manager.apply_injection("command", self.address_command, &mut code3)?;
         } else {
             self.injection_manager.remove_injection("ssl_send")?;
-            self.injection_manager.remove_injection("get_premade")?;
+            self.injection_manager.remove_injection("getModes")?;
             self.injection_manager.remove_injection("command")?;
         }
 
@@ -411,6 +437,34 @@ impl LeaderboardScores {
         unsafe { let _ = windows::Win32::Foundation::CloseHandle(handle); }
         
         buffer.truncate(bytes_read);
+        
+        // Define response patterns for different leaderboard types
+        let patterns = [
+            [0x81, 0x7E, 0x1C, 0x39, 0x7B], // NG_RANK_TEAMS_16
+            [0x81, 0x7E, 0x1A, 0xAD, 0x7B], // NG_RANK_FREEFORALL_16
+            [0x81, 0x7E, 0x19, 0xE0, 0x7B], // NG_RANK_DUELS_16
+        ];
+        
+        // Find the start of JSON data using any of the patterns
+        for pattern in &patterns {
+            if let Some(start_pos) = buffer.windows(pattern.len()).position(|window| window == pattern) {
+                // Start from the '{' character (last byte of pattern)
+                let json_start = start_pos + pattern.len() - 1;
+                if json_start < buffer.len() {
+                    // Find the end by looking for consecutive null bytes (0x00 0x00)
+                    let mut end_pos = buffer.len();
+                    for i in json_start..buffer.len()-1 {
+                        if buffer[i] == 0x00 && buffer[i + 1] == 0x00 {
+                            end_pos = i;
+                            break;
+                        }
+                    }
+                    
+                    return Ok(buffer[json_start..end_pos].to_vec());
+                }
+            }
+        }
+        
         Ok(buffer)
     }
 
