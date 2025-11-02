@@ -1,6 +1,7 @@
 // Learn more about Tauri commands at https://tauri.app/develop/calling-rust/
 
 use hudhook::inject::Process;
+use serde::Serialize;
 use std::process::Command;
 use std::thread;
 use std::time::Duration;
@@ -10,7 +11,9 @@ use tauri::AppHandle;
 use tauri::Manager;
 use tracing;
 use windows::Win32::System::Threading::{OpenProcess, PROCESS_CREATE_THREAD, PROCESS_QUERY_INFORMATION, PROCESS_VM_OPERATION, PROCESS_VM_READ, PROCESS_VM_WRITE};
+use windows::Win32::System::Diagnostics::ToolHelp::{CreateToolhelp32Snapshot, TH32CS_SNAPPROCESS, PROCESSENTRY32, Process32First, Process32Next};
 use windows::Win32::Foundation::{HANDLE, CloseHandle};
+use std::ffi::CStr;
 use std::error::Error;
 
 
@@ -81,6 +84,45 @@ fn setup_logging() {
     tracing_subscriber::fmt()
         .with_env_filter(EnvFilter::from_default_env())
         .init();
+}
+
+#[derive(Serialize)]
+struct ProcessInfo {
+    pid: u32,
+    name: String,
+}
+
+#[command]
+fn list_processes() -> Result<Vec<ProcessInfo>, String> {
+    let mut processes = Vec::new();
+
+    let snapshot = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) }
+        .map_err(|e| format!("Failed to create process snapshot: {}", e))?;
+
+    let mut entry = PROCESSENTRY32::default();
+    entry.dwSize = std::mem::size_of::<PROCESSENTRY32>() as u32;
+
+    let mut ok = unsafe { Process32First(snapshot, &mut entry).is_ok() };
+    while ok {
+        let name = unsafe {
+            CStr::from_ptr(entry.szExeFile.as_ptr())
+                .to_string_lossy()
+                .into_owned()
+        };
+
+        processes.push(ProcessInfo {
+            pid: entry.th32ProcessID,
+            name,
+        });
+
+        ok = unsafe { Process32Next(snapshot, &mut entry).is_ok() };
+    }
+
+    unsafe {
+        let _ = CloseHandle(snapshot);
+    }
+
+    Ok(processes)
 }
 
 #[command]
@@ -174,7 +216,8 @@ pub fn run() {
         .plugin(tauri_plugin_opener::init())
         .invoke_handler(tauri::generate_handler![
             launch_northgard,
-            attach_to_pid
+            attach_to_pid,
+            list_processes
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
