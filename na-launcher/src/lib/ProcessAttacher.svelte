@@ -2,6 +2,7 @@
   import { onMount } from 'svelte';
   import { createEventDispatcher } from 'svelte';
   import { invoke } from '@tauri-apps/api/core';
+  import { RefreshCw, PlugZap, TriangleAlert } from 'lucide-svelte';
 
   type Proc = { pid: number; name: string };
 
@@ -61,17 +62,25 @@
       placeholder="Filter by name or PID"
       bind:value={filter}
     />
-    <button type="button" class="btn preset-tonal" onclick={loadProcesses}>
-      Refresh
+    <button
+      type="button"
+      class="btn preset-tonal-primary"
+      onclick={loadProcesses}
+      aria-label="Refresh process list"
+    >
+      <RefreshCw size={16} />
     </button>
   </div>
 
   {#if loading}
     <div class="text-sm opacity-70">Loading processes...</div>
   {:else if error}
-    <div class="text-sm text-error-500">{error}</div>
+    <div class="preset-filled-error-500 rounded-md p-2 text-sm flex items-center gap-2">
+      <TriangleAlert size={16} />
+      <span>{error}</span>
+    </div>
   {:else}
-    <div class="overflow-auto max-h-64 rounded-md border border-surface-200-800">
+    <div class="overflow-auto max-h-64 rounded-lg p-2 preset-tonal-surface">
       <table class="table w-full text-sm">
         <thead>
           <tr>
@@ -86,8 +95,14 @@
               <td class="p-2">{p.name}</td>
               <td class="p-2">{p.pid}</td>
               <td class="p-2">
-                <button type="button" class="btn preset-filled w-full" onclick={() => attach(p.pid, p.name)}>
-                  Attach
+                <button
+                  type="button"
+                  class="btn preset-filled-primary-500 w-full flex items-center justify-center gap-2"
+                  onclick={() => attach(p.pid, p.name)}
+                  aria-label={`Attach to ${p.name}`}
+                >
+                  <PlugZap size={16} />
+                  <span class="sr-only">Attach</span>
                 </button>
               </td>
             </tr>

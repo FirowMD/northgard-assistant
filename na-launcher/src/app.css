@@ -26,3 +26,15 @@
 @import '@skeletonlabs/skeleton/themes/wintry';
 
 @import '@skeletonlabs/skeleton-svelte';
+
+/* Custom preset additions */
+.preset-gradient {
+  background-image: linear-gradient(-45deg, var(--color-primary-300), var(--color-primary-700));
+  color: var(--color-primary-contrast-500);
+}
+
+.preset-glass-primary {
+  background: color-mix(in oklab, var(--color-primary-500) 40%, transparent);
+  box-shadow: 0 0px 30px color-mix(in oklab, var(--color-primary-500) 50%, transparent) inset;
+  backdrop-filter: blur(16px);
+}
