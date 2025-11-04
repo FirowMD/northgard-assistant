@@ -1,3 +1,7 @@
+/*
+    Allows to see players in queue.
+*/
+
 use crate::modules::basic::*;
 use crate::modules::aob_injection::AobInjection;
 use crate::modules::mem_alloc::*;
