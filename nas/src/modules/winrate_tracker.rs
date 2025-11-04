@@ -289,15 +289,25 @@ impl WinrateTracker {
             code.push(rbx)?;
             code.push(rcx)?;
             code.push(rdx)?;
+            code.push(r8)?;
+            code.push(r9)?;
+            code.push(r10)?;
+            code.push(r11)?;
 
             code.mov(rbx, self.var_ptr_gamestate as u64)?;
             code.mov(qword_ptr(rbx), rcx)?;
             code.mov(rax, self.address_getteamplayercount as u64)?;
+            code.sub(rsp, 0x20)?;
             code.call(rax)?;
+            code.add(rsp, 0x20)?;
             
             code.mov(rbx, self.var_ptr_teamplayercount as u64)?;
             code.mov(dword_ptr(rbx), eax)?;
 
+            code.pop(r11)?;
+            code.pop(r10)?;
+            code.pop(r9)?;
+            code.pop(r8)?;
             code.pop(rdx)?;
             code.pop(rcx)?;
             code.pop(rbx)?;
