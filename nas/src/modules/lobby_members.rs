@@ -2,10 +2,11 @@
     Allows to see players in queue.
 */
 
-use crate::modules::basic::*;
-use crate::modules::aob_injection::AobInjection;
-use crate::modules::mem_alloc::*;
+use crate::modules::libmem_injection::LibmemInjection;
 use crate::modules::hashlink::*;
+use libmem::Process;
+use crate::utils::libmem_ex::{get_target_process, free, read_qword_ex, read_utf16_string_ex, allocate_region_mrprotect};
+use windows::Win32::System::Memory::PAGE_READWRITE;
 use iced_x86::code_asm::*;
 use std::error::Error;
 use std::sync::Mutex;
@@ -20,20 +21,35 @@ pub struct LobbyMembers {
     address_logjoinlobby: usize,
     var_ptr_logs: usize,
     var_ptr_lobby: usize,
-    injection_loglobbyinfo: Mutex<Option<AobInjection>>,
-    injection_loguserjoined: Mutex<Option<AobInjection>>,
-    injection_loguserleft: Mutex<Option<AobInjection>>,
-    injection_logjoinlobby: Mutex<Option<AobInjection>>,
+    injection_loglobbyinfo: Mutex<Option<LibmemInjection>>,
+    injection_loguserjoined: Mutex<Option<LibmemInjection>>,
+    injection_loguserleft: Mutex<Option<LibmemInjection>>,
+    injection_logjoinlobby: Mutex<Option<LibmemInjection>>,
     members: Arc<Mutex<Vec<String>>>,
-    mem_allocator: MemoryAllocator,
+    lm_process: Process,
+    lm_alloc_addr: usize,
+    lm_alloc_size: usize,
 }
 
 impl LobbyMembers {
+    /// Convenience: enable all lobby member injections
+    pub fn enable(&self) -> Result<(), Box<dyn Error>> {
+        self.lobby_members_apply(true)
+    }
+
+    /// Convenience: disable all lobby member injections
+    pub fn disable(&self) -> Result<(), Box<dyn Error>> {
+        self.lobby_members_apply(false)
+    }
+
     pub fn new(pid: u32) -> Result<Self, Box<dyn Error>> {
         let members = Arc::new(Mutex::new(Vec::new()));
-        let mut memory_allocator = MemoryAllocator::new(pid, 0x1000)?;
-        let var_ptr_logs_tmp = memory_allocator.allocate_var("String", DataType::Pointer)?;
-        let var_ptr_lobby_tmp = memory_allocator.allocate_var("mpman.Lobby", DataType::Pointer)?;
+        let lm_process = get_target_process(pid).ok_or("Failed to get process with libmem")?;
+        let lm_alloc_size = 0x1000usize;
+        let allocated = allocate_region_mrprotect(pid, lm_alloc_size, PAGE_READWRITE)?;
+        let lm_alloc_addr = allocated.base_address as usize;
+        let var_ptr_logs_tmp = lm_alloc_addr;
+        let var_ptr_lobby_tmp = lm_alloc_addr + 8;
 
         let mut lobby = Self {
             pid,
@@ -49,7 +65,9 @@ impl LobbyMembers {
             injection_loguserleft: Mutex::new(None),
             injection_logjoinlobby: Mutex::new(None),
             members,
-            mem_allocator: memory_allocator,
+            lm_process,
+            lm_alloc_addr,
+            lm_alloc_size,
         };
         lobby.lobby_members_init()?;
         
@@ -57,10 +75,8 @@ impl LobbyMembers {
     }
 
     pub fn update_members(&self) {
-        if let Ok(var_ptr_logs) = read_qword(self.pid, self.var_ptr_logs) {
-            if var_ptr_logs == 0 {
-                return;
-            }
+        if let Some(var_ptr_logs) = read_qword_ex(&self.lm_process, self.var_ptr_logs) {
+            if var_ptr_logs == 0 { return; }
         }
 
         if let Ok(new_members) = self.lobby_members_extract() {
@@ -101,89 +117,38 @@ impl LobbyMembers {
         let mut injection_logjoinlobby = self.injection_logjoinlobby.lock().unwrap();
 
         if enable {
-            if injection_loglobbyinfo.is_none() {
-                // Save `logLobbyInfo` result to `var_ptr_logs`
-                let mut code = CodeAssembler::new(64)?;
-                code.push(rcx)?;
-                code.mov(rcx, self.var_ptr_logs as u64)?;
-                code.mov(qword_ptr(rcx), rax)?;
-                code.pop(rcx)?;
+            self.ensure_injection(
+                &mut injection_loglobbyinfo,
+                self.address_loglobbyinfo_body,
+                || self.asm_save_log_to_var(),
+                "loglobbyinfo",
+            )?;
 
-                *injection_loglobbyinfo = Some(AobInjection::new(self.pid, self.address_loglobbyinfo_body, &mut code)?);
-                tracing::info!("Successfully injected: loglobbyinfo at 0x{:X}", self.address_loglobbyinfo_body);
-            }
+            self.ensure_injection(
+                &mut injection_loguserjoined,
+                self.address_loguserjoined,
+                || self.asm_call_loglobbyinfo_with_lobby_from_var(),
+                "loguserjoined",
+            )?;
 
-            if injection_loguserjoined.is_none() {
-                // Take `mpman.Lobby` argument from `var_ptr_lobby`
-                // Call `logLobbyInfo`
-                let mut code = CodeAssembler::new(64)?;
-                code.push(rax)?;
-                code.push(rcx)?;
-                code.mov(rax, self.var_ptr_lobby as u64)?;
-                code.mov(rcx, qword_ptr(rax))?;
-                code.mov(rax, self.address_loglobbyinfo as u64)?;
-                code.call(rax)?;
-                code.pop(rcx)?;
-                code.pop(rax)?;
+            self.ensure_injection(
+                &mut injection_loguserleft,
+                self.address_loguserleft,
+                || self.asm_call_loglobbyinfo_with_lobby_from_var(),
+                "loguserleft",
+            )?;
 
-                *injection_loguserjoined = Some(AobInjection::new(self.pid, self.address_loguserjoined, &mut code)?);
-                tracing::info!("Successfully injected: loguserjoined at 0x{:X}", self.address_loguserjoined);
-            }
-
-            if injection_loguserleft.is_none() {
-                // Take `mpman.Lobby` argument from `var_ptr_lobby`
-                // Call `logLobbyInfo`
-                let mut code = CodeAssembler::new(64)?;
-                code.push(rax)?;
-                code.push(rcx)?;
-                code.mov(rax, self.var_ptr_lobby as u64)?;
-                code.mov(rcx, qword_ptr(rax))?;
-                code.mov(rax, self.address_loglobbyinfo as u64)?;
-                code.call(rax)?;
-                code.pop(rcx)?;
-                code.pop(rax)?;
-
-                *injection_loguserleft = Some(AobInjection::new(self.pid, self.address_loguserleft, &mut code)?);
-                tracing::info!("Successfully injected: loguserleft at 0x{:X}", self.address_loguserleft);
-            }
-
-            if injection_logjoinlobby.is_none() {
-                // Save `mpman.Lobby` argument to `var_ptr_lobby`
-                let mut code = CodeAssembler::new(64)?;
-                code.push(rax)?;
-                code.push(rcx)?;
-                code.mov(rax, self.var_ptr_lobby as u64)?;
-                code.mov(qword_ptr(rax), rcx)?;
-                code.pop(rcx)?;
-                code.pop(rax)?;
-
-                *injection_logjoinlobby = Some(AobInjection::new(self.pid, self.address_logjoinlobby, &mut code)?);
-                tracing::info!("Successfully injected: logjoinlobby at 0x{:X}", self.address_logjoinlobby);
-            }
+            self.ensure_injection(
+                &mut injection_logjoinlobby,
+                self.address_logjoinlobby,
+                || self.asm_save_lobby_arg_to_var(),
+                "logjoinlobby",
+            )?;
         } else {
-            if let Some(inj) = injection_loglobbyinfo.as_ref() {
-                inj.undo()?;
-                *injection_loglobbyinfo = None;
-                tracing::info!("Successfully removed: loglobbyinfo at 0x{:X}", self.address_loglobbyinfo_body);
-            }
-
-            if let Some(inj) = injection_loguserjoined.as_ref() {
-                inj.undo()?;
-                *injection_loguserjoined = None;
-                tracing::info!("Successfully removed: loguserjoined at 0x{:X}", self.address_loguserjoined);
-            }
-
-            if let Some(inj) = injection_loguserleft.as_ref() {
-                inj.undo()?;
-                *injection_loguserleft = None;
-                tracing::info!("Successfully removed: loguserleft at 0x{:X}", self.address_loguserleft);
-            }
-
-            if let Some(inj) = injection_logjoinlobby.as_ref() {
-                inj.undo()?;
-                *injection_logjoinlobby = None;
-                tracing::info!("Successfully removed: logjoinlobby at 0x{:X}", self.address_logjoinlobby);
-            }
+            self.remove_injection(&mut injection_loglobbyinfo, self.address_loglobbyinfo_body, "loglobbyinfo")?;
+            self.remove_injection(&mut injection_loguserjoined, self.address_loguserjoined, "loguserjoined")?;
+            self.remove_injection(&mut injection_loguserleft, self.address_loguserleft, "loguserleft")?;
+            self.remove_injection(&mut injection_logjoinlobby, self.address_logjoinlobby, "logjoinlobby")?;
         }
         
         Ok(())
@@ -191,14 +156,19 @@ impl LobbyMembers {
 
     /// Extracts users from `var_ptr_logs`
     pub fn lobby_members_extract(&self) -> Result<String, Box<dyn Error>> {
-        let log_addr_ptr = read_qword(self.pid, self.var_ptr_logs)? as usize;
-        let log_addr = read_qword(self.pid, log_addr_ptr + 8)? as usize;
-        let log_data = read_utf16_string(self.pid, log_addr)?;
+        let log_addr_ptr = read_qword_ex(&self.lm_process, self.var_ptr_logs)
+            .ok_or("libmem read_qword_ex failed")? as usize;
+        let log_addr = read_qword_ex(&self.lm_process, log_addr_ptr + 8)
+            .ok_or("libmem read_qword_ex failed")? as usize;
+        let log_data = read_utf16_string_ex(&self.lm_process, log_addr, 0x1000)
+            .ok_or("libmem read_utf16_string_ex failed")?;
         
         tracing::debug!("log_data: {}", log_data);
 
         Ok(log_data)
     }
+
+    
 
     /// Remove ID of each player
     /// Example of input (FFA):
@@ -272,15 +242,89 @@ impl LobbyMembers {
     pub fn get_members(&self) -> Vec<String> {
         self.update_members();
         let members = self.members.lock().unwrap().clone();
-        // let new_members = self.remove_id(members);
-        // tracing::debug!("get_members() returning {} members", new_members.len());
-        // new_members
         members
+    }
+
+    /// Get members with IDs stripped; keeps team designation when present
+    pub fn get_members_cleaned(&self) -> Vec<String> {
+        self.update_members();
+        let members = self.members.lock().unwrap().clone();
+        self.remove_id(members)
     }
 }
 
 impl Drop for LobbyMembers {
     fn drop(&mut self) {
-        self.mem_allocator.free().unwrap();
+        let _ = free(&self.lm_process, self.lm_alloc_addr, self.lm_alloc_size);
+    }
+}
+
+// ---- Internal helpers to assemble and manage injections ----
+impl LobbyMembers {
+    fn ensure_injection<F>(&self,
+        slot: &mut Option<LibmemInjection>,
+        target_addr: usize,
+        build_code: F,
+        label: &str,
+    ) -> Result<(), Box<dyn Error>>
+    where
+        F: FnOnce() -> Result<CodeAssembler, Box<dyn Error>>,
+    {
+        if slot.is_none() {
+            let mut code = build_code()?;
+            *slot = Some(LibmemInjection::new(self.pid, target_addr, &mut code, &self.lm_process)?);
+            tracing::info!("Successfully injected: {} at 0x{:X}", label, target_addr);
+        }
+        Ok(())
+    }
+
+    fn remove_injection(
+        &self,
+        slot: &mut Option<LibmemInjection>,
+        target_addr: usize,
+        label: &str,
+    ) -> Result<(), Box<dyn Error>> {
+        if let Some(inj) = slot.as_ref() {
+            inj.undo()?;
+            *slot = None;
+            tracing::info!("Successfully removed: {} at 0x{:X}", label, target_addr);
+        }
+        Ok(())
+    }
+
+    // Save `logLobbyInfo` result (RAX) into `var_ptr_logs`
+    fn asm_save_log_to_var(&self) -> Result<CodeAssembler, Box<dyn Error>> {
+        let mut code = CodeAssembler::new(64)?;
+        code.push(rcx)?;
+        code.mov(rcx, self.var_ptr_logs as u64)?;
+        code.mov(qword_ptr(rcx), rax)?;
+        code.pop(rcx)?;
+        Ok(code)
+    }
+
+    // Take mpman.Lobby from `var_ptr_lobby` and call `logLobbyInfo`
+    fn asm_call_loglobbyinfo_with_lobby_from_var(&self) -> Result<CodeAssembler, Box<dyn Error>> {
+        let mut code = CodeAssembler::new(64)?;
+        code.push(rax)?;
+        code.push(rcx)?;
+        code.mov(rax, self.var_ptr_lobby as u64)?;
+        code.mov(rcx, qword_ptr(rax))?;
+        code.mov(rax, self.address_loglobbyinfo as u64)?;
+        code.call(rax)?;
+        code.pop(rcx)?;
+        code.pop(rax)?;
+        Ok(code)
+    }
+
+    // Save `mpman.Lobby` argument (RCX) into `var_ptr_lobby`
+    fn asm_save_lobby_arg_to_var(&self) -> Result<CodeAssembler, Box<dyn Error>> {
+        let mut code = CodeAssembler::new(64)?;
+        code.push(rax)?;
+        code.push(rcx)?;
+        code.mov(rax, self.var_ptr_lobby as u64)?;
+        code.mov(qword_ptr(rax), rcx)?;
+        code.pop(rcx)?;
+        code.pop(rax)?;
+        Ok(code)
     }
 }

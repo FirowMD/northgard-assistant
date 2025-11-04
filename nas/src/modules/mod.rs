@@ -1,10 +1,10 @@
-pub mod aob_injection;
 pub mod auto_accept;
 pub mod auto_lockin;
 pub mod base;
 pub mod basic;
 pub mod game_common;
 pub mod hashlink;
+pub mod libmem_injection;
 pub mod lobby_members;
 pub mod lore_hook;
 pub mod mem_alloc;
@@ -12,12 +12,12 @@ pub mod build_guide;
 pub mod leaderboard_scores;
 pub mod winrate_tracker;
 
-pub use aob_injection::*;
 pub use auto_accept::*;
 pub use auto_lockin::*;
 pub use base::*;
 pub use game_common::*;
 pub use hashlink::*;
+pub use libmem_injection::*;
 pub use lobby_members::*;
 pub use lore_hook::*;
 pub use mem_alloc::*;

@@ -1,14 +1,17 @@
 use crate::modules::basic::*;
-use crate::modules::aob_injection::AobInjection;
+use crate::modules::libmem_injection::LibmemInjection;
 use crate::modules::mem_alloc::*;
 use crate::modules::hashlink::*;
 use iced_x86::code_asm::*;
 use std::error::Error;
 use std::sync::Mutex;
+use crate::utils::libmem_ex::get_target_process;
+use libmem::Process;
 
 #[allow(dead_code)]
 pub struct GameCommon {
     pid: u32,
+    process: Process,
 
     // fn get_width@590 (hxd.Window) -> i32 (2 regs, 2 ops)
     address_getwidth: usize,
@@ -20,8 +23,8 @@ pub struct GameCommon {
     // i32
     var_ptr_winheight: usize,
 
-    injection_getwidth: Mutex<Option<AobInjection>>,
-    injection_getheight: Mutex<Option<AobInjection>>,
+    injection_getwidth: Mutex<Option<LibmemInjection>>,
+    injection_getheight: Mutex<Option<LibmemInjection>>,
 
     mem_allocator: MemoryAllocator,
 }
@@ -31,6 +34,7 @@ impl GameCommon {
         let mut memory_allocator = MemoryAllocator::new(pid, 0x1000)?;
         let var_ptr_windowwidth = memory_allocator.allocate_var("WindowWidth", DataType::U32)?;
         let var_ptr_windowheight = memory_allocator.allocate_var("WindowHeight", DataType::U32)?;
+        let process = get_target_process(pid).ok_or("Failed to get process with libmem")?;
 
         let mut game_common = Self {
             pid,
@@ -38,6 +42,7 @@ impl GameCommon {
             var_ptr_winheight: var_ptr_windowheight,
             address_getwidth: 0,
             address_getheight: 0,
+            process,
             injection_getwidth: Mutex::new(None),
             injection_getheight: Mutex::new(None),
             mem_allocator: memory_allocator,
@@ -79,7 +84,7 @@ impl GameCommon {
                 code.pop(rax)?;
                 code.popfq()?;
 
-                *injection_getwidth = Some(AobInjection::new(self.pid, self.address_getwidth, &mut code)?);
+                *injection_getwidth = Some(LibmemInjection::new(self.pid, self.address_getwidth, &mut code, &self.process)?);
                 tracing::info!("Successfully injected: getwidth at 0x{:X}", self.address_getwidth);
             }
 
@@ -94,7 +99,7 @@ impl GameCommon {
                 code.pop(rax)?;
                 code.popfq()?;
 
-                *injection_getheight = Some(AobInjection::new(self.pid, self.address_getheight, &mut code)?);
+                *injection_getheight = Some(LibmemInjection::new(self.pid, self.address_getheight, &mut code, &self.process)?);
                 tracing::info!("Successfully injected: getheight at 0x{:X}", self.address_getheight);
             }
         } else {
