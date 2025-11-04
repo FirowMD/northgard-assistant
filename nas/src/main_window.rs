@@ -5,7 +5,6 @@ use std::sync::Arc;
 use hudhook::*;
 use imgui::Condition;
 use imgui::Key;
-// Using legacy columns API for tabular layout
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -17,7 +16,6 @@ use crate::modules::lobby_members::LobbyMembers;
 use crate::modules::auto_lockin::AutoLockin;
 use crate::modules::game_common::GameCommon;
 use crate::modules::build_guide::{BuildGuideManager};
-use crate::modules::leaderboard_scores::{LeaderboardScores, LeaderboardType};
 use crate::modules::winrate_tracker::WinrateTracker;
 use crate::core::building_window::BuildingWindow;
 use crate::core::lore_window::LoreWindow;
@@ -85,11 +83,6 @@ pub struct MainWindow {
     warband_window: Option<WarbandWindow>,
     build_guide_manager: Option<BuildGuideManager>,
     selected_guide: Option<String>,
-    leaderboard_scores: Option<LeaderboardScores>,
-    leaderboard_enabled: bool,
-    leaderboard_observe_count: i32,
-    leaderboard_selected_type: usize,
-    leaderboard_buffer_text: String,
     winrate_tracker: Option<WinrateTracker>,
     winrate_enabled: bool,
 }
@@ -113,11 +106,6 @@ impl MainWindow {
             warband_window: None,
             build_guide_manager: None,
             selected_guide: None,
-            leaderboard_scores: None,
-            leaderboard_enabled: false,
-            leaderboard_observe_count: 40,
-            leaderboard_selected_type: 0,
-            leaderboard_buffer_text: String::new(),
             winrate_tracker: None,
             winrate_enabled: false,
         }
@@ -249,18 +237,6 @@ impl ImguiRenderLoop for MainWindow {
         self.building_window = Some(BuildingWindow::new());
         self.warband_window = Some(WarbandWindow::new());
         
-        // Initialize LeaderboardScores
-        match LeaderboardScores::new(self.pid) {
-            Ok(leaderboard_scores) => {
-                self.leaderboard_scores = Some(leaderboard_scores);
-                tracing::info!("Successfully initialized LeaderboardScores");
-            }
-            Err(e) => {
-                tracing::error!("Failed to initialize LeaderboardScores: {}", e);
-            }
-        }
-
-        // Initialize WinrateTracker
         match WinrateTracker::new(self.pid) {
             Ok(wrt) => {
                 self.winrate_tracker = Some(wrt);
@@ -330,7 +306,6 @@ impl ImguiRenderLoop for MainWindow {
                                 0.0
                             };
 
-                            // Summary in 2 columns
                             ui.columns(2, "##winrate_summary_cols", true);
                             ui.text("Tracked 3v3 Games");
                             ui.next_column();
@@ -353,7 +328,6 @@ impl ImguiRenderLoop for MainWindow {
                             ui.next_column();
                             ui.columns(1, "", false);
 
-                            // Breakdown by victory type (if any)
                             if !data.by_victory.is_empty() {
                                 ui.separator();
                                 ui.text("By Victory Type:");
@@ -608,91 +582,6 @@ impl ImguiRenderLoop for MainWindow {
 
                     ui.separator();
                     
-                    if ui.collapsing_header("Leaderboard Scores", imgui::TreeNodeFlags::empty()) {
-                        if let Some(leaderboard) = &mut self.leaderboard_scores {
-                            if ui.checkbox("Enable Leaderboard Scores", &mut self.leaderboard_enabled) {
-                                if let Err(e) = leaderboard.apply(self.leaderboard_enabled) {
-                                    tracing::error!("Failed to toggle leaderboard: {}", e);
-                                    self.leaderboard_enabled = !self.leaderboard_enabled;
-                                } else {
-                                    tracing::info!("Leaderboard {}", if self.leaderboard_enabled { "enabled" } else { "disabled" });
-                                }
-                            }
-
-                            if self.leaderboard_enabled {
-                                // InputInt for observe_player_count
-                                ui.text("Observe Player Count:");
-                                let mut observe_count = self.leaderboard_observe_count;
-                                if ui.input_int("##observe_count", &mut observe_count).build() {
-                                    if observe_count > 0 && observe_count <= 2000 {
-                                        self.leaderboard_observe_count = observe_count;
-                                        if let Err(e) = leaderboard.set_observable_player_count(observe_count) {
-                                            tracing::error!("Failed to set observe count: {}", e);
-                                        }
-                                    }
-                                }
-                                ui.same_line();
-                                ui.text_disabled("(1-2000)");
-                                
-                                // Combo for leaderboard_type
-                                let leaderboard_types = ["Duels", "FreeForAll", "Teams"];
-                                let combo_text = leaderboard_types[self.leaderboard_selected_type];
-                                
-                                if let Some(token) = ui.begin_combo("Leaderboard Type", combo_text) {
-                                    for (idx, lb_type) in leaderboard_types.iter().enumerate() {
-                                        let is_selected = idx == self.leaderboard_selected_type;
-                                        
-                                        if ui.selectable_config(lb_type).selected(is_selected).build() {
-                                            self.leaderboard_selected_type = idx;
-                                            let lb_type = match idx {
-                                                0 => LeaderboardType::Duels,
-                                                1 => LeaderboardType::FreeForAll,
-                                                2 => LeaderboardType::Teams,
-                                                _ => LeaderboardType::Duels,
-                                            };
-                                            if let Err(e) = leaderboard.set_leaderboard_type(lb_type) {
-                                                tracing::error!("Failed to set leaderboard type: {}", e);
-                                            }
-                                        }
-                                    }
-                                    token.end();
-                                }
-                                
-                                ui.separator();
-                                
-                                // Button to get receive buffer
-                                if ui.button("Get Receive Buffer") {
-                                    match leaderboard.get_recv_buffer() {
-                                        Ok(buffer) => {
-                                            self.leaderboard_buffer_text = String::from_utf8_lossy(&buffer).to_string();
-                                            tracing::info!("Retrieved {} bytes from receive buffer", buffer.len());
-                                        }
-                                        Err(e) => {
-                                            self.leaderboard_buffer_text = format!("Error: {}", e);
-                                            tracing::error!("Failed to get receive buffer: {}", e);
-                                        }
-                                    }
-                                }
-                                
-                                // Display receive buffer in a child window
-                                ui.child_window("leaderboard_buffer")
-                                    .size([0.0, 150.0])
-                                    .border(true)
-                                    .build(|| {
-                                        if self.leaderboard_buffer_text.is_empty() {
-                                            ui.text_disabled("Click 'Get Receive Buffer' to see leaderboard data");
-                                        } else {
-                                            ui.text_wrapped(&self.leaderboard_buffer_text);
-                                        }
-                                    });
-                            } else {
-                                ui.text_disabled("Enable leaderboard scores to see options");
-                            }
-                        } else {
-                            ui.text_colored([1.0, 0.5, 0.5, 1.0], "Leaderboard Scores failed to initialize");
-                            ui.text_disabled("Check logs for initialization errors");
-                        }
-                    }
                 });
         }
 
