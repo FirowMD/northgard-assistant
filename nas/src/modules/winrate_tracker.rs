@@ -181,6 +181,27 @@ impl WinrateTracker {
         Ok(())
     }
 
+    fn create_endgame_code(&mut self, kind: EndGameKind) -> Result<CodeAssembler, Box<dyn Error>> {
+        let mut code = CodeAssembler::new(64)?;
+
+        code.pushfq()?;
+        code.push(rax)?;
+        code.push(rbx)?;
+        code.push(rcx)?;
+        code.push(rdx)?;
+
+        code.mov(rbx, self.var_ptr_endgamekind as u64)?;
+        code.mov(dword_ptr(rbx), kind as u32)?;
+
+        code.pop(rdx)?;
+        code.pop(rcx)?;
+        code.pop(rbx)?;
+        code.pop(rax)?;
+        code.popfq()?;
+        
+        Ok(code)
+    }
+
     pub fn apply(&mut self, enable: bool) -> Result<(), Box<dyn Error>> {
         if enable {
             /*
@@ -196,11 +217,6 @@ impl WinrateTracker {
             code.push(rbx)?;
             code.push(rcx)?;
             code.push(rdx)?;
-            code.push(r8)?;
-            code.push(r9)?;
-            code.push(r10)?;
-            code.push(r11)?;
-            code.push(r12)?;
 
             code.mov(rbx, self.var_ptr_gamestate as u64)?;
             code.mov(qword_ptr(rbx), rcx)?;
@@ -222,11 +238,6 @@ impl WinrateTracker {
             code.call(rax)?;
 
             code.set_label(&mut label_exit)?;
-            code.pop(r12)?;
-            code.pop(r11)?;
-            code.pop(r10)?;
-            code.pop(r9)?;
-            code.pop(r8)?;
             code.pop(rdx)?;
             code.pop(rcx)?;
             code.pop(rbx)?;
@@ -235,7 +246,42 @@ impl WinrateTracker {
 
             self.injection_manager.apply_injection("set_victory", self.address_setvictory, &mut code)?;
 
+            /*
+            Injection: EndGameScene
+                1. Save result of game to `var_ptr_endgamekind`
+            */
+            let mut code = self.create_endgame_code(EndGameKind::Defeat)?;
+            self.injection_manager.apply_injection("defeat", self.address_defeat, &mut code)?;
 
+            let mut code = self.create_endgame_code(EndGameKind::Victory)?;
+            self.injection_manager.apply_injection("default_victory", self.address_defaultvictory, &mut code)?;
+
+            let mut code = self.create_endgame_code(EndGameKind::Fame)?;
+            self.injection_manager.apply_injection("fame_victory", self.address_famevictory, &mut code)?;
+
+            let mut code = self.create_endgame_code(EndGameKind::Helheim)?;
+            self.injection_manager.apply_injection("helheim_victory", self.address_helheimvictory, &mut code)?;
+
+            let mut code = self.create_endgame_code(EndGameKind::Faith)?;
+            self.injection_manager.apply_injection("faith_victory", self.address_faithvictory, &mut code)?;
+
+            let mut code = self.create_endgame_code(EndGameKind::Lore)?;
+            self.injection_manager.apply_injection("lore_victory", self.address_lorevictory, &mut code)?;
+
+            let mut code = self.create_endgame_code(EndGameKind::Mealsquirrel)?;
+            self.injection_manager.apply_injection("mealsquirrel_victory", self.address_mealsquirrelvictory, &mut code)?;
+
+            let mut code = self.create_endgame_code(EndGameKind::Odinsword)?;
+            self.injection_manager.apply_injection("odinsword_victory", self.address_odinswordvictory, &mut code)?;
+
+            let mut code = self.create_endgame_code(EndGameKind::Money)?;
+            self.injection_manager.apply_injection("money_victory", self.address_moneyvictory, &mut code)?;
+
+            let mut code = self.create_endgame_code(EndGameKind::Owltitan)?;
+            self.injection_manager.apply_injection("owltitan_victory", self.address_owltitanvictory, &mut code)?;
+
+            let mut code = self.create_endgame_code(EndGameKind::Yggdrasil)?;
+            self.injection_manager.apply_injection("yggdrasil_victory", self.address_yggdrasilvictory, &mut code)?;
         } else {
             self.injection_manager.remove_injection("set_victory")?;
             self.injection_manager.remove_injection("get_teamplayercount")?;
