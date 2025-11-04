@@ -14,22 +14,22 @@
     fn toString@126 (hl.types.ArrayObj) -> String (14 regs, 51 ops)
 */
 
-use crate::memory;
 use crate::modules::base::InjectionManager;
 use crate::modules::mem_alloc::{MemoryAllocator, DataType};
 use crate::modules::hashlink::*;
-use crate::modules::basic::aob_scan_mrprotect;
-use windows::Win32::System::Threading::{OpenProcess, PROCESS_VM_READ};
-use windows::Win32::System::Diagnostics::Debug::ReadProcessMemory;
-use windows::Win32::System::Memory::{PAGE_EXECUTE, PAGE_EXECUTE_READ, PAGE_EXECUTE_READWRITE};
-use windows::Win32::Foundation::BOOL;
 use iced_x86::code_asm::*;
 use std::error::Error;
+use std::collections::HashMap;
+use std::fs;
+use std::path::PathBuf;
+use serde::{Deserialize, Serialize};
 
 const MAX_WINRATE_MEMORY_REGION_SIZE: usize = 0x2000;
 
+#[derive(PartialEq, Eq, Debug, Clone, Copy)]
+#[repr(i32)]
 enum EndGameKind {
-    None,
+    None = 0,
     Defeat,
     Victory, // defaultVictory
     Fame,
@@ -46,6 +46,7 @@ enum EndGameKind {
 pub struct WinrateTracker {
     pid: u32,
     enabled: bool,
+    file_path: PathBuf,
 
     address_setvictory: usize,
     address_getteamplayercount: usize,
@@ -78,7 +79,66 @@ pub struct WinrateTracker {
 
 impl WinrateTracker {
     extern "win64" fn update_winrate_callback(instance_ptr: *mut WinrateTracker, endgame_kind: EndGameKind) {
-        // TODO: Here we will update statistics
+        let wrt = unsafe { &mut *instance_ptr };
+        if endgame_kind == EndGameKind::None {
+            return;
+        }
+
+        #[derive(Serialize, Deserialize, Default)]
+        struct WinrateData {
+            total_3v3: u32,
+            wins: u32,
+            losses: u32,
+            by_victory: HashMap<String, u32>,
+        }
+
+        fn classify(kind: EndGameKind) -> (bool, Option<&'static str>) {
+            if kind == EndGameKind::Defeat {
+                return (false, None);
+            }
+            let reason = match kind {
+                k if k == EndGameKind::Victory => Some("defaultVictory"),
+                k if k == EndGameKind::Fame => Some("fameVictory"),
+                k if k == EndGameKind::Helheim => Some("helheimVictory"),
+                k if k == EndGameKind::Faith => Some("faithVictory"),
+                k if k == EndGameKind::Lore => Some("loreVictory"),
+                k if k == EndGameKind::Mealsquirrel => Some("mealSquirrelVictory"),
+                k if k == EndGameKind::Odinsword => Some("odinSwordVictory"),
+                k if k == EndGameKind::Money => Some("moneyVictory"),
+                k if k == EndGameKind::Owltitan => Some("owlTitanVictory"),
+                k if k == EndGameKind::Yggdrasil => Some("yggdrasilVictory"),
+                _ => None,
+            };
+            (true, reason)
+        }
+
+        let (is_win, reason) = classify(endgame_kind);
+
+        if let Some(parent) = wrt.file_path.parent() {
+            let _ = fs::create_dir_all(parent);
+        }
+
+        let mut data: WinrateData = match fs::read_to_string(&wrt.file_path) {
+            Ok(content) if !content.trim().is_empty() => serde_json::from_str(&content).unwrap_or_default(),
+            _ => WinrateData::default(),
+        };
+
+        data.total_3v3 = data.total_3v3.saturating_add(1);
+        if is_win {
+            data.wins = data.wins.saturating_add(1);
+            if let Some(key) = reason {
+                let entry = data.by_victory.entry(key.to_string()).or_insert(0);
+                *entry = entry.saturating_add(1);
+            }
+        } else {
+            data.losses = data.losses.saturating_add(1);
+        }
+
+        if let Ok(json) = serde_json::to_string_pretty(&data) {
+            let _ = fs::write(&wrt.file_path, json);
+        }
+
+        let _ = wrt.memory_allocator.write_var("EndGameKind", EndGameKind::None as i32);
     }
 
     pub fn new(pid: u32) -> Result<Self, Box<dyn Error>> {
@@ -111,9 +171,17 @@ impl WinrateTracker {
         injection_manager.add_injection("owltitan_victory".to_string());
         injection_manager.add_injection("yggdrasil_victory".to_string());
 
+        let file_path: PathBuf = if let Ok(pd) = std::env::var("PROGRAMDATA") {
+            PathBuf::from(pd).join("northgard-assistant").join("winrate.json")
+        } else {
+            let base = dirs::data_dir().unwrap_or_else(|| PathBuf::from("."));
+            base.join("northgard-assistant").join("winrate.json")
+        };
+
         let mut winrate_tracker = Self {
             pid,
             enabled: false,
+            file_path,
 
             address_setvictory: 0,
             address_getteamplayercount: 0,
@@ -149,7 +217,6 @@ impl WinrateTracker {
     }
 
     pub fn init(&mut self) -> Result<(), Box<dyn Error>> {
-        // Try Hashlink first (if functions are known)
         let guard = Hashlink::instance(self.pid).lock().unwrap();
         if let Some(hashlink) = guard.as_ref() {
             self.address_setvictory = hashlink.get_function_address("set_victory", Some(0))?;
