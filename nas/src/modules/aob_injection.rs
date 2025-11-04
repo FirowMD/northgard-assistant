@@ -203,6 +203,7 @@ impl AobInjection {
         Ok(())
     }
 
+    #[allow(dead_code)]
     fn create_jmp(from: u64, to: u64) -> Result<Vec<u8>, Box<dyn Error>> {
         let mut encoder = Encoder::new(64);
         let instruction = Instruction::with_branch(Code::Jmp_rel32_64, to)?;

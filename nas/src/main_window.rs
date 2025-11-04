@@ -257,6 +257,14 @@ impl ImguiRenderLoop for MainWindow {
             tracing::info!("Window visibility toggled: {}", self.window_visible);
         }
 
+        if self.winrate_enabled {
+            if let Some(wrt) = &mut self.winrate_tracker {
+                if let Err(e) = wrt.poll_and_update() {
+                    tracing::error!("Winrate poll failed: {}", e);
+                }
+            }
+        }
+
         if self.window_visible {
             ui.window("Northgard Assistant")
                 .size([300.0, 400.0], Condition::FirstUseEver)

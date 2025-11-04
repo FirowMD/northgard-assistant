@@ -11,13 +11,13 @@ use hudhook::*;
 mod main_window;
 
 #[no_mangle]
-pub unsafe extern "stdcall" fn DllMain(
+pub unsafe extern "system" fn DllMain(
     hmodule: hudhook::windows::Win32::Foundation::HINSTANCE,
     reason: u32,
     _: *mut std::ffi::c_void,
 ) {
     if reason == hudhook::windows::Win32::System::SystemServices::DLL_PROCESS_ATTACH {
-        // main_window::setup_tracing();
+        main_window::setup_tracing();
         hudhook::tracing::trace!("DllMain()");
         let _ = std::thread::spawn(move || {
             if let Err(e) = hudhook::Hudhook::builder()
@@ -40,4 +40,4 @@ mod tests {
     #[test]
     fn test_auto_accept() {
     }
-} 
+}

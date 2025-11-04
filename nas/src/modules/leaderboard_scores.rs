@@ -187,7 +187,7 @@ impl LeaderboardScores {
             return Err("Pattern not found: ssl_recv".into());
         }
 
-        const SSL_NEW_RET_OFFSET: usize = 86;
+        // const SSL_NEW_RET_OFFSET: usize = 86;
 
         self.address_ssl_send = addr_ssl_send[0];
         self.address_ssl_recv = addr_ssl_recv[0];
