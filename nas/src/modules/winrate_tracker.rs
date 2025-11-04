@@ -254,14 +254,10 @@ impl WinrateTracker {
         code.pushfq()?;
         code.push(rax)?;
         code.push(rbx)?;
-        code.push(rcx)?;
-        code.push(rdx)?;
 
         code.mov(rbx, self.var_ptr_endgamekind as u64)?;
         code.mov(dword_ptr(rbx), kind as u32)?;
 
-        code.pop(rdx)?;
-        code.pop(rcx)?;
         code.pop(rbx)?;
         code.pop(rax)?;
         code.popfq()?;
@@ -287,8 +283,6 @@ impl WinrateTracker {
 
             code.mov(rbx, self.var_ptr_gamestate as u64)?;
             code.mov(qword_ptr(rbx), rcx)?;
-
-            code.mov(rcx, rcx)?; // GameState
             code.mov(rax, self.address_getteamplayercount as u64)?;
             code.call(rax)?;
             
@@ -298,10 +292,12 @@ impl WinrateTracker {
             code.cmp(eax, 3)?; // We need to track only 3v3 games
             code.jne(label_exit)?;
 
-            // Call update_winrate_callback
-            code.mov(rcx, qword_ptr(self.var_ptr_self_instance as u64))?;
-            code.mov(rdx, qword_ptr(self.var_ptr_endgamekind as u64))?;
-            code.mov(rax, qword_ptr(self.var_ptr_callback_addr as u64))?;
+            code.mov(rbx, self.var_ptr_self_instance as u64)?;
+            code.mov(rcx, qword_ptr(rbx))?;
+            code.mov(rbx, self.var_ptr_endgamekind as u64)?;
+            code.mov(edx, dword_ptr(rbx))?;
+            code.mov(rbx, self.var_ptr_callback_addr as u64)?;
+            code.mov(rax, qword_ptr(rbx))?;
             code.call(rax)?;
 
             code.set_label(&mut label_exit)?;

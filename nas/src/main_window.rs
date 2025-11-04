@@ -5,6 +5,10 @@ use std::sync::Arc;
 use hudhook::*;
 use imgui::Condition;
 use imgui::Key;
+// Using legacy columns API for tabular layout
+use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
+use std::path::PathBuf;
 use tracing_subscriber::prelude::*;
 use tracing_subscriber::{fmt, EnvFilter};
 use crate::modules::auto_accept::AutoAccept;
@@ -14,6 +18,7 @@ use crate::modules::auto_lockin::AutoLockin;
 use crate::modules::game_common::GameCommon;
 use crate::modules::build_guide::{BuildGuideManager};
 use crate::modules::leaderboard_scores::{LeaderboardScores, LeaderboardType};
+use crate::modules::winrate_tracker::WinrateTracker;
 use crate::core::building_window::BuildingWindow;
 use crate::core::lore_window::LoreWindow;
 use crate::core::warband_window::WarbandWindow;
@@ -85,6 +90,8 @@ pub struct MainWindow {
     leaderboard_observe_count: i32,
     leaderboard_selected_type: usize,
     leaderboard_buffer_text: String,
+    winrate_tracker: Option<WinrateTracker>,
+    winrate_enabled: bool,
 }
 
 impl MainWindow {
@@ -111,15 +118,42 @@ impl MainWindow {
             leaderboard_observe_count: 40,
             leaderboard_selected_type: 0,
             leaderboard_buffer_text: String::new(),
+            winrate_tracker: None,
+            winrate_enabled: false,
         }
     }
 
     fn update_pid(&mut self) {
         self.pid = std::process::id();
     }
+
+    fn winrate_file_path() -> PathBuf {
+        if let Ok(pd) = std::env::var("PROGRAMDATA") {
+            PathBuf::from(pd).join("northgard-assistant").join("winrate.json")
+        } else {
+            let base = dirs::data_dir().unwrap_or_else(|| PathBuf::from("."));
+            base.join("northgard-assistant").join("winrate.json")
+        }
+    }
+
+    fn read_winrate_data(&self) -> Option<WinrateData> {
+        let path = Self::winrate_file_path();
+        match std::fs::read_to_string(&path) {
+            Ok(content) if !content.trim().is_empty() => serde_json::from_str::<WinrateData>(&content).ok(),
+            _ => None,
+        }
+    }
 }
 
 const FONT_DATA: &[u8] = include_bytes!("../assets/Microsoft Yahei.ttf");
+
+#[derive(Serialize, Deserialize, Default)]
+struct WinrateData {
+    total_3v3: u32,
+    wins: u32,
+    losses: u32,
+    by_victory: HashMap<String, u32>,
+}
 
 impl ImguiRenderLoop for MainWindow {
     fn initialize<'a>(
@@ -225,6 +259,17 @@ impl ImguiRenderLoop for MainWindow {
                 tracing::error!("Failed to initialize LeaderboardScores: {}", e);
             }
         }
+
+        // Initialize WinrateTracker
+        match WinrateTracker::new(self.pid) {
+            Ok(wrt) => {
+                self.winrate_tracker = Some(wrt);
+                tracing::info!("Successfully initialized WinrateTracker");
+            }
+            Err(e) => {
+                tracing::error!("Failed to initialize WinrateTracker: {}", e);
+            }
+        }
     }
 
     fn render(&mut self, ui: &mut imgui::Ui) {
@@ -260,6 +305,75 @@ impl ImguiRenderLoop for MainWindow {
                     }
 
                     ui.separator();
+
+                    if ui.collapsing_header("Winrate Tracker", imgui::TreeNodeFlags::empty()) {
+                        if let Some(wrt) = &mut self.winrate_tracker {
+                            let prev_state_wrt = self.winrate_enabled;
+                            if ui.checkbox("Enable Winrate Tracker", &mut self.winrate_enabled) {
+                                if let Err(e) = wrt.apply(self.winrate_enabled) {
+                                    tracing::error!("Winrate tracker failed: {}", e);
+                                    self.winrate_enabled = prev_state_wrt;
+                                } else {
+                                    tracing::info!(
+                                        "Winrate tracker {}",
+                                        if self.winrate_enabled { "enabled" } else { "disabled" }
+                                    );
+                                }
+                            }
+                        }
+
+                        if let Some(data) = self.read_winrate_data() {
+                            let total_games = data.wins.saturating_add(data.losses);
+                            let winrate_pct = if total_games > 0 {
+                                (data.wins as f32 / total_games as f32) * 100.0
+                            } else {
+                                0.0
+                            };
+
+                            // Summary in 2 columns
+                            ui.columns(2, "##winrate_summary_cols", true);
+                            ui.text("Tracked 3v3 Games");
+                            ui.next_column();
+                            ui.text(format!("{}", data.total_3v3));
+                            ui.next_column();
+
+                            ui.text("Wins");
+                            ui.next_column();
+                            ui.text(format!("{}", data.wins));
+                            ui.next_column();
+
+                            ui.text("Losses");
+                            ui.next_column();
+                            ui.text(format!("{}", data.losses));
+                            ui.next_column();
+
+                            ui.text("Winrate");
+                            ui.next_column();
+                            ui.text(format!("{:.1}%", winrate_pct));
+                            ui.next_column();
+                            ui.columns(1, "", false);
+
+                            // Breakdown by victory type (if any)
+                            if !data.by_victory.is_empty() {
+                                ui.separator();
+                                ui.text("By Victory Type:");
+                                ui.columns(2, "##winrate_victory_cols", true);
+                                ui.text("Type");
+                                ui.next_column();
+                                ui.text("Count");
+                                ui.next_column();
+                                for (kind, count) in data.by_victory.iter() {
+                                    ui.text(kind);
+                                    ui.next_column();
+                                    ui.text(format!("{}", count));
+                                    ui.next_column();
+                                }
+                                ui.columns(1, "", false);
+                            }
+                        } else {
+                            ui.text_disabled("No winrate data saved yet");
+                        }
+                    }
 
                     if let Some(auto_lockin) = &mut self.auto_lockin {
                         if let Some(clans) = auto_lockin.get_clans_game() {
