@@ -11,7 +11,7 @@ Disappear on:
 
 */
 
-use crate::modules::aob_injection::AobInjection;
+use crate::modules::libmem_injection::LibmemInjection;
 use crate::modules::mem_alloc::*;
 use crate::modules::hashlink::*;
 use crate::modules::basic::*;
@@ -38,9 +38,9 @@ pub struct LoreHook {
     // When new Lore is unlocked
     pub signal_lore_unlocked: Signal,
 
-    injection_playunlockanim: Mutex<Option<AobInjection>>,
-    injection_none_appear: Mutex<Option<AobInjection>>,
-    injection_remove: Mutex<Option<AobInjection>>,
+    injection_playunlockanim: Mutex<Option<LibmemInjection>>,
+    injection_none_appear: Mutex<Option<LibmemInjection>>,
+    injection_remove: Mutex<Option<LibmemInjection>>,
     mem_allocator: MemoryAllocator,
 }
 

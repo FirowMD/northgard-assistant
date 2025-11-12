@@ -1,4 +1,5 @@
 pub mod memory;
+pub mod libmem_ex;
 pub mod signals;
 // Re-export commonly used items from memory module
 pub use memory::{

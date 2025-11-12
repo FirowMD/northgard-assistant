@@ -5,8 +5,6 @@ use std::sync::Arc;
 use hudhook::*;
 use imgui::Condition;
 use imgui::Key;
-use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
 use std::path::PathBuf;
 use tracing_subscriber::prelude::*;
 use tracing_subscriber::{fmt, EnvFilter};
@@ -17,6 +15,8 @@ use crate::modules::auto_lockin::AutoLockin;
 use crate::modules::game_common::GameCommon;
 use crate::modules::build_guide::{BuildGuideManager};
 use crate::modules::winrate_tracker::WinrateTracker;
+use crate::modules::{callback_system, winrate_tracker};
+use crate::modules::leaderboard_scores::{LeaderboardScores, LeaderboardType, LeaderboardResponse};
 use crate::core::building_window::BuildingWindow;
 use crate::core::lore_window::LoreWindow;
 use crate::core::warband_window::WarbandWindow;
@@ -85,6 +85,11 @@ pub struct MainWindow {
     selected_guide: Option<String>,
     winrate_tracker: Option<WinrateTracker>,
     winrate_enabled: bool,
+    leaderboard_scores: Option<LeaderboardScores>,
+    leaderboard_enabled: bool,
+    leaderboard_type_idx: usize,
+    leaderboard_count_idx: usize,
+    leaderboard_last_json: Option<String>,
 }
 
 impl MainWindow {
@@ -108,6 +113,11 @@ impl MainWindow {
             selected_guide: None,
             winrate_tracker: None,
             winrate_enabled: false,
+            leaderboard_scores: None,
+            leaderboard_enabled: false,
+            leaderboard_type_idx: 0,
+            leaderboard_count_idx: 1,
+            leaderboard_last_json: None,
         }
     }
 
@@ -116,18 +126,14 @@ impl MainWindow {
     }
 
     fn winrate_file_path() -> PathBuf {
-        if let Ok(pd) = std::env::var("PROGRAMDATA") {
-            PathBuf::from(pd).join("northgard-assistant").join("winrate.json")
-        } else {
-            let base = dirs::data_dir().unwrap_or_else(|| PathBuf::from("."));
-            base.join("northgard-assistant").join("winrate.json")
-        }
+        use crate::modules::winrate_store::WinrateStore;
+        WinrateStore::new_default_path().path().to_path_buf()
     }
 
-    fn read_winrate_data(&self) -> Option<WinrateData> {
+    fn read_winrate_data(&self) -> Option<crate::modules::winrate_store::WinrateStats> {
         let path = Self::winrate_file_path();
         match std::fs::read_to_string(&path) {
-            Ok(content) if !content.trim().is_empty() => serde_json::from_str::<WinrateData>(&content).ok(),
+            Ok(content) if !content.trim().is_empty() => serde_json::from_str::<crate::modules::winrate_store::WinrateStats>(&content).ok(),
             _ => None,
         }
     }
@@ -135,13 +141,6 @@ impl MainWindow {
 
 const FONT_DATA: &[u8] = include_bytes!("../assets/Microsoft Yahei.ttf");
 
-#[derive(Serialize, Deserialize, Default)]
-struct WinrateData {
-    total_3v3: u32,
-    wins: u32,
-    losses: u32,
-    by_victory: HashMap<String, u32>,
-}
 
 impl ImguiRenderLoop for MainWindow {
     fn initialize<'a>(
@@ -241,9 +240,26 @@ impl ImguiRenderLoop for MainWindow {
             Ok(wrt) => {
                 self.winrate_tracker = Some(wrt);
                 tracing::info!("Successfully initialized WinrateTracker");
+                callback_system::instance().register(|event: &winrate_tracker::EndGameEvent| {
+                    let store = crate::modules::winrate_store::WinrateStore::new_default_path();
+                    let _ = store.update_from_kind(event.kind);
+                });
             }
             Err(e) => {
                 tracing::error!("Failed to initialize WinrateTracker: {}", e);
+            }
+        }
+
+        match LeaderboardScores::new(self.pid) {
+            Ok(lb) => {
+                self.leaderboard_scores = Some(lb);
+                tracing::info!("Successfully initialized LeaderboardScores");
+                callback_system::instance().register(|event: &LeaderboardResponse| {
+                    tracing::info!("Leaderboard response received: {} bytes", event.data.len());
+                });
+            }
+            Err(e) => {
+                tracing::error!("Failed to initialize LeaderboardScores: {}", e);
             }
         }
     }
@@ -258,12 +274,18 @@ impl ImguiRenderLoop for MainWindow {
         }
 
         if self.winrate_enabled {
-            if let Some(wrt) = &mut self.winrate_tracker {
-                if let Err(e) = wrt.poll_and_update() {
-                    tracing::error!("Winrate poll failed: {}", e);
-                }
+            if let Some(event) = winrate_tracker::take_pending_endgame() {
+                callback_system::instance().emit(event);
             }
         }
+
+        if self.leaderboard_enabled {
+            if let Some(event) = crate::modules::leaderboard_scores::LeaderboardScores::take_pending_leaderboard() {
+                callback_system::instance().emit(event);
+            }
+        }
+
+        callback_system::instance().update();
 
         if self.window_visible {
             ui.window("Northgard Assistant")
@@ -307,9 +329,9 @@ impl ImguiRenderLoop for MainWindow {
                         }
 
                         if let Some(data) = self.read_winrate_data() {
-                            let total_games = data.wins.saturating_add(data.losses);
+                            let total_games = data.total_wins.saturating_add(data.total_losses);
                             let winrate_pct = if total_games > 0 {
-                                (data.wins as f32 / total_games as f32) * 100.0
+                                (data.total_wins as f32 / total_games as f32) * 100.0
                             } else {
                                 0.0
                             };
@@ -317,17 +339,17 @@ impl ImguiRenderLoop for MainWindow {
                             ui.columns(2, "##winrate_summary_cols", true);
                             ui.text("Tracked 3v3 Games");
                             ui.next_column();
-                            ui.text(format!("{}", data.total_3v3));
+                            ui.text(format!("{}", data.entries.len()));
                             ui.next_column();
 
                             ui.text("Wins");
                             ui.next_column();
-                            ui.text(format!("{}", data.wins));
+                            ui.text(format!("{}", data.total_wins));
                             ui.next_column();
 
                             ui.text("Losses");
                             ui.next_column();
-                            ui.text(format!("{}", data.losses));
+                            ui.text(format!("{}", data.total_losses));
                             ui.next_column();
 
                             ui.text("Winrate");
@@ -336,7 +358,7 @@ impl ImguiRenderLoop for MainWindow {
                             ui.next_column();
                             ui.columns(1, "", false);
 
-                            if !data.by_victory.is_empty() {
+                            if !data.by_reason.is_empty() {
                                 ui.separator();
                                 ui.text("By Victory Type:");
                                 ui.columns(2, "##winrate_victory_cols", true);
@@ -344,7 +366,7 @@ impl ImguiRenderLoop for MainWindow {
                                 ui.next_column();
                                 ui.text("Count");
                                 ui.next_column();
-                                for (kind, count) in data.by_victory.iter() {
+                                for (kind, count) in data.by_reason.iter() {
                                     ui.text(kind);
                                     ui.next_column();
                                     ui.text(format!("{}", count));
@@ -354,6 +376,81 @@ impl ImguiRenderLoop for MainWindow {
                             }
                         } else {
                             ui.text_disabled("No winrate data saved yet");
+                        }
+                    }
+
+                    ui.separator();
+
+                    if ui.collapsing_header("Leaderboard Scores", imgui::TreeNodeFlags::empty()) {
+                        if let Some(lb) = &mut self.leaderboard_scores {
+                            let prev_state_lb = self.leaderboard_enabled;
+                            if ui.checkbox("Enable Leaderboard Scores", &mut self.leaderboard_enabled) {
+                                if let Err(e) = lb.apply(self.leaderboard_enabled) {
+                                    tracing::error!("Leaderboard scores failed: {}", e);
+                                    self.leaderboard_enabled = prev_state_lb;
+                                } else {
+                                    tracing::info!(
+                                        "Leaderboard scores {}",
+                                        if self.leaderboard_enabled { "enabled" } else { "disabled" }
+                                    );
+                                }
+                            }
+
+                            let lb_types = ["Duels", "FreeForAll", "Teams"];
+                            let current_type = lb_types[self.leaderboard_type_idx];
+                            if let Some(token) = ui.begin_combo("##lb_type_combo", current_type) {
+                                for (idx, name) in lb_types.iter().enumerate() {
+                                    let is_selected = idx == self.leaderboard_type_idx;
+                                    if ui.selectable_config(name).selected(is_selected).build() {
+                                        self.leaderboard_type_idx = idx;
+                                        let ty = match idx { 0 => LeaderboardType::Duels, 1 => LeaderboardType::FreeForAll, _ => LeaderboardType::Teams };
+                                        if let Err(e) = lb.set_leaderboard_type(ty) {
+                                            tracing::error!("Failed to set leaderboard type: {}", e);
+                                        }
+                                    }
+                                }
+                                token.end();
+                            }
+
+                            let count_options = [20, 40, 80, 120, 200];
+                            let current_count = count_options[self.leaderboard_count_idx];
+                            if let Some(token) = ui.begin_combo("##lb_count_combo", &format!("{} players", current_count)) {
+                                for (idx, count) in count_options.iter().enumerate() {
+                                    let is_selected = idx == self.leaderboard_count_idx;
+                                    if ui.selectable_config(&format!("{} players", count)).selected(is_selected).build() {
+                                        self.leaderboard_count_idx = idx;
+                                        if let Err(e) = lb.set_observable_player_count(*count as i32) {
+                                            tracing::error!("Failed to set player count: {}", e);
+                                        }
+                                    }
+                                }
+                                token.end();
+                            }
+
+                            if ui.button("Read Latest Result") {
+                                match lb.get_recv_buffer() {
+                                    Ok(bytes) => {
+                                        let text = String::from_utf8_lossy(&bytes).to_string();
+                                        self.leaderboard_last_json = Some(text);
+                                    }
+                                    Err(e) => {
+                                        tracing::error!("Failed to read leaderboard buffer: {}", e);
+                                    }
+                                }
+                            }
+
+                            if let Some(text) = &self.leaderboard_last_json {
+                                ui.child_window("leaderboard_json")
+                                    .size([0.0, 160.0])
+                                    .border(true)
+                                    .build(|| {
+                                        ui.text_wrapped(text);
+                                    });
+                            } else {
+                                ui.text_disabled("No leaderboard response read yet");
+                            }
+                        } else {
+                            ui.text_disabled("Leaderboard module not initialized");
                         }
                     }
 

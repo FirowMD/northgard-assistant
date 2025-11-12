@@ -1,20 +1,8 @@
-use crate::utils::memory::{MemoryRegion, allocate_region_mrprotect};
+use crate::utils::libmem_ex::{allocate_region_mrprotect, write_bytes_ex, read_bytes_ex, free, get_target_process};
 use windows::Win32::System::Memory::PAGE_READWRITE;
-use crate::modules::basic::*;
-use windows::Win32::System::Threading::{OpenProcess, PROCESS_VM_WRITE, PROCESS_VM_OPERATION, PROCESS_VM_READ};
-use windows::Win32::System::Diagnostics::Debug::{WriteProcessMemory, ReadProcessMemory};
-use windows::Win32::Foundation::{HANDLE, BOOL, CloseHandle};
 use std::error::Error;
-use std::ffi::c_void;
+use libmem::Process;
 use std::collections::HashMap;
-
-struct ProcessHandleWrapper(HANDLE);
-
-impl Drop for ProcessHandleWrapper {
-    fn drop(&mut self) {
-        unsafe { let _ = CloseHandle(self.0); }
-    }
-}
 
 pub struct Variable {
     pub name: String,
@@ -55,22 +43,27 @@ impl DataType {
 
 pub struct MemoryAllocator {
     pid: u32,
-    allocated_region: MemoryRegion,
+    allocated_addr: usize,
+    allocated_size: usize,
     next_free_addr: usize,
     next_free_size: usize,
     variables: HashMap<String, Variable>,
+    process: Process,
 }
 
 impl MemoryAllocator {
     pub fn new(pid: u32, total_size: usize) -> Result<Self, Box<dyn Error>> {
+        let process = get_target_process(pid).ok_or("Failed to get process with libmem")?;
         let allocated = allocate_region_mrprotect(pid, total_size, PAGE_READWRITE)?;
         
         Ok(Self {
             pid,
+            allocated_addr: allocated.base_address,
+            allocated_size: allocated.region_size,
             next_free_addr: allocated.base_address,
             next_free_size: allocated.region_size,
-            allocated_region: allocated,
             variables: HashMap::new(),
+            process,
         })
     }
 
@@ -132,13 +125,12 @@ impl MemoryAllocator {
         let size = str.len() + 1;
         let addr = self.allocate_var_with_size(name, DataType::ByteArray, size)?;
 
-        // Write the string to the allocated memory using `write_byte`
-        for (i, byte) in str.as_bytes().iter().enumerate() {
-            write_byte(self.pid, addr + i, *byte)?;
+        // Write the string bytes
+        if !str.is_empty() {
+            write_bytes_ex(&self.process, addr, str.as_bytes()).ok_or("libmem write_bytes_ex failed")?;
         }
-
-        // Place null terminator at the end
-        write_byte(self.pid, addr + size - 1, 0)?;
+        // Null terminator
+        write_bytes_ex(&self.process, addr + size - 1, &[0u8]).ok_or("libmem write_bytes_ex failed")?;
 
         Ok(addr)
     }
@@ -148,15 +140,13 @@ impl MemoryAllocator {
         let size = str.len() * 2 + 2;
         let addr = self.allocate_var_with_size(name, DataType::ByteArray, size)?;
 
-        // Write the string to the allocated memory using `write_utf16_string`
-        for (i, byte) in str.as_bytes().iter().enumerate() {
-            write_byte(self.pid, addr + i * 2, *byte)?;
-            write_byte(self.pid, addr + i * 2 + 1, 0)?;
+        // Write UTF-16LE bytes
+        for (i, ch) in str.encode_utf16().enumerate() {
+            let bytes = ch.to_le_bytes();
+            write_bytes_ex(&self.process, addr + i * 2, &bytes).ok_or("libmem write_bytes_ex failed")?;
         }
-
-        // Place null terminator at the end
-        write_byte(self.pid, addr + size - 1, 0)?;
-        write_byte(self.pid, addr + size - 2, 0)?;
+        // Null terminator (2 bytes)
+        write_bytes_ex(&self.process, addr + size - 2, &[0u8, 0u8]).ok_or("libmem write_bytes_ex failed")?;
 
         Ok(addr)
     }
@@ -171,28 +161,9 @@ impl MemoryAllocator {
             return Err("Type size mismatch".into());
         }
 
-        let handle_wrapper = ProcessHandleWrapper(unsafe {
-            OpenProcess(
-                PROCESS_VM_WRITE | PROCESS_VM_OPERATION,
-                BOOL::from(false),
-                self.pid,
-            )
-        }.map_err(|e| format!("Failed to open process: {:?}", e))?);
-
-        let mut bytes_written = 0;
-        unsafe {
-            WriteProcessMemory(
-                handle_wrapper.0,
-                var.address as *mut _,
-                &value as *const T as *const c_void,
-                var.size,
-                Some(&mut bytes_written),
-            )
-        }.map_err(|_| "Failed to write memory")?;
-
-        if bytes_written != var.size {
-            return Err("Incomplete write".into());
-        }
+        let size = std::mem::size_of::<T>();
+        let bytes = unsafe { std::slice::from_raw_parts(&value as *const T as *const u8, size) };
+        write_bytes_ex(&self.process, var.address, bytes).ok_or("libmem write_bytes_ex failed")?;
 
         Ok(())
     }
@@ -206,28 +177,7 @@ impl MemoryAllocator {
             return Err("Byte array too large for allocated variable".into());
         }
 
-        let handle_wrapper = ProcessHandleWrapper(unsafe {
-            OpenProcess(
-                PROCESS_VM_WRITE | PROCESS_VM_OPERATION,
-                BOOL::from(false),
-                self.pid,
-            )
-        }.map_err(|e| format!("Failed to open process: {:?}", e))?);
-
-        let mut bytes_written = 0;
-        unsafe {
-            WriteProcessMemory(
-                handle_wrapper.0,
-                var.address as *mut _,
-                bytes.as_ptr() as *const c_void,
-                bytes.len(),
-                Some(&mut bytes_written),
-            )
-        }.map_err(|_| "Failed to write memory")?;
-
-        if bytes_written != bytes.len() {
-            return Err("Incomplete write".into());
-        }
+        write_bytes_ex(&self.process, var.address, bytes).ok_or("libmem write_bytes_ex failed")?;
 
         Ok(())
     }
@@ -242,32 +192,14 @@ impl MemoryAllocator {
             return Err("Type size mismatch".into());
         }
 
-        let handle_wrapper = ProcessHandleWrapper(unsafe {
-            OpenProcess(
-                PROCESS_VM_READ,
-                BOOL::from(false),
-                self.pid,
-            )
-        }.map_err(|e| format!("Failed to open process: {:?}", e))?);
+        let bytes = read_bytes_ex(&self.process, var.address, var.size).ok_or("libmem read_bytes_ex failed")?;
+        if bytes.len() != var.size { return Err("Incomplete read".into()); }
 
-        let mut value: T = T::default();
-        let mut bytes_read = 0;
-
+        let mut out = std::mem::MaybeUninit::<T>::uninit();
         unsafe {
-            ReadProcessMemory(
-                handle_wrapper.0,
-                var.address as *const _,
-                &mut value as *mut T as *mut c_void,
-                var.size,
-                Some(&mut bytes_read),
-            )
-        }.map_err(|_| "Failed to read memory")?;
-
-        if bytes_read != var.size {
-            return Err("Incomplete read".into());
+            std::ptr::copy_nonoverlapping(bytes.as_ptr(), out.as_mut_ptr() as *mut u8, var.size);
+            Ok(out.assume_init())
         }
-
-        Ok(value)
     }
 
     /// Get variable address by name
@@ -277,24 +209,7 @@ impl MemoryAllocator {
 
     /// Free all allocated memory
     pub fn free(&self) -> Result<(), Box<dyn Error>> {
-        unsafe {
-            use windows::Win32::System::Memory::{VirtualFreeEx, MEM_RELEASE};
-            
-            let handle_wrapper = ProcessHandleWrapper(
-                OpenProcess(
-                    PROCESS_VM_OPERATION,
-                    BOOL::from(false),
-                    self.pid,
-                )
-            .map_err(|e| format!("Failed to open process: {:?}", e))?);
-
-            VirtualFreeEx(
-                handle_wrapper.0,
-                self.allocated_region.base_address as *mut c_void,
-                0,
-                MEM_RELEASE,
-            ).map_err(|_| "Failed to free memory")?;
-        }
+        free(&self.process, self.allocated_addr, self.allocated_size).ok_or("libmem free failed")?;
 
         Ok(())
     }

@@ -1,6 +1,8 @@
-use crate::modules::aob_injection::AobInjection;
+use crate::modules::libmem_injection::LibmemInjection;
 use crate::modules::mem_alloc::*;
 use crate::modules::hashlink::*;
+use crate::utils::libmem_ex::get_target_process;
+use libmem::Process;
 use std::error::Error;
 use std::sync::Mutex;
 use std::collections::HashMap;
@@ -60,15 +62,18 @@ pub trait Command {
 
 /// Injection manager to handle common injection patterns
 pub struct InjectionManager {
-    injections: HashMap<String, Mutex<Option<AobInjection>>>,
+    injections: HashMap<String, Mutex<Option<LibmemInjection>>>,
     pid: u32,
+    process: Process,
 }
 
 impl InjectionManager {
     pub fn new(pid: u32) -> Self {
+        let process = get_target_process(pid).expect("Failed to get process with libmem");
         Self {
             injections: HashMap::new(),
             pid,
+            process,
         }
     }
 
@@ -89,7 +94,7 @@ impl InjectionManager {
             }
 
             // Apply new injection
-            *injection = Some(AobInjection::new(self.pid, address, code)?);
+            *injection = Some(LibmemInjection::new(self.pid, address, code, &self.process)?);
             tracing::info!("Applied injection: {} at 0x{:X}", name, address);
         }
         Ok(())
