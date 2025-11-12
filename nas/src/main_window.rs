@@ -5,8 +5,6 @@ use std::sync::Arc;
 use hudhook::*;
 use imgui::Condition;
 use imgui::Key;
-use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
 use std::path::PathBuf;
 use tracing_subscriber::prelude::*;
 use tracing_subscriber::{fmt, EnvFilter};
@@ -17,6 +15,7 @@ use crate::modules::auto_lockin::AutoLockin;
 use crate::modules::game_common::GameCommon;
 use crate::modules::build_guide::{BuildGuideManager};
 use crate::modules::winrate_tracker::WinrateTracker;
+use crate::modules::{callback_system, winrate_tracker};
 use crate::core::building_window::BuildingWindow;
 use crate::core::lore_window::LoreWindow;
 use crate::core::warband_window::WarbandWindow;
@@ -116,18 +115,14 @@ impl MainWindow {
     }
 
     fn winrate_file_path() -> PathBuf {
-        if let Ok(pd) = std::env::var("PROGRAMDATA") {
-            PathBuf::from(pd).join("northgard-assistant").join("winrate.json")
-        } else {
-            let base = dirs::data_dir().unwrap_or_else(|| PathBuf::from("."));
-            base.join("northgard-assistant").join("winrate.json")
-        }
+        use crate::modules::winrate_store::WinrateStore;
+        WinrateStore::new_default_path().path().to_path_buf()
     }
 
-    fn read_winrate_data(&self) -> Option<WinrateData> {
+    fn read_winrate_data(&self) -> Option<crate::modules::winrate_store::WinrateStats> {
         let path = Self::winrate_file_path();
         match std::fs::read_to_string(&path) {
-            Ok(content) if !content.trim().is_empty() => serde_json::from_str::<WinrateData>(&content).ok(),
+            Ok(content) if !content.trim().is_empty() => serde_json::from_str::<crate::modules::winrate_store::WinrateStats>(&content).ok(),
             _ => None,
         }
     }
@@ -135,13 +130,6 @@ impl MainWindow {
 
 const FONT_DATA: &[u8] = include_bytes!("../assets/Microsoft Yahei.ttf");
 
-#[derive(Serialize, Deserialize, Default)]
-struct WinrateData {
-    total_3v3: u32,
-    wins: u32,
-    losses: u32,
-    by_victory: HashMap<String, u32>,
-}
 
 impl ImguiRenderLoop for MainWindow {
     fn initialize<'a>(
@@ -241,6 +229,10 @@ impl ImguiRenderLoop for MainWindow {
             Ok(wrt) => {
                 self.winrate_tracker = Some(wrt);
                 tracing::info!("Successfully initialized WinrateTracker");
+                callback_system::instance().register(|event: &winrate_tracker::EndGameEvent| {
+                    let store = crate::modules::winrate_store::WinrateStore::new_default_path();
+                    let _ = store.update_from_kind(event.kind);
+                });
             }
             Err(e) => {
                 tracing::error!("Failed to initialize WinrateTracker: {}", e);
@@ -258,11 +250,10 @@ impl ImguiRenderLoop for MainWindow {
         }
 
         if self.winrate_enabled {
-            if let Some(wrt) = &mut self.winrate_tracker {
-                if let Err(e) = wrt.poll_and_update() {
-                    tracing::error!("Winrate poll failed: {}", e);
-                }
+            if let Some(event) = winrate_tracker::take_pending_endgame() {
+                callback_system::instance().emit(event);
             }
+            callback_system::instance().update();
         }
 
         if self.window_visible {
@@ -307,9 +298,9 @@ impl ImguiRenderLoop for MainWindow {
                         }
 
                         if let Some(data) = self.read_winrate_data() {
-                            let total_games = data.wins.saturating_add(data.losses);
+                            let total_games = data.total_wins.saturating_add(data.total_losses);
                             let winrate_pct = if total_games > 0 {
-                                (data.wins as f32 / total_games as f32) * 100.0
+                                (data.total_wins as f32 / total_games as f32) * 100.0
                             } else {
                                 0.0
                             };
@@ -317,17 +308,17 @@ impl ImguiRenderLoop for MainWindow {
                             ui.columns(2, "##winrate_summary_cols", true);
                             ui.text("Tracked 3v3 Games");
                             ui.next_column();
-                            ui.text(format!("{}", data.total_3v3));
+                            ui.text(format!("{}", data.entries.len()));
                             ui.next_column();
 
                             ui.text("Wins");
                             ui.next_column();
-                            ui.text(format!("{}", data.wins));
+                            ui.text(format!("{}", data.total_wins));
                             ui.next_column();
 
                             ui.text("Losses");
                             ui.next_column();
-                            ui.text(format!("{}", data.losses));
+                            ui.text(format!("{}", data.total_losses));
                             ui.next_column();
 
                             ui.text("Winrate");
@@ -336,7 +327,7 @@ impl ImguiRenderLoop for MainWindow {
                             ui.next_column();
                             ui.columns(1, "", false);
 
-                            if !data.by_victory.is_empty() {
+                            if !data.by_reason.is_empty() {
                                 ui.separator();
                                 ui.text("By Victory Type:");
                                 ui.columns(2, "##winrate_victory_cols", true);
@@ -344,7 +335,7 @@ impl ImguiRenderLoop for MainWindow {
                                 ui.next_column();
                                 ui.text("Count");
                                 ui.next_column();
-                                for (kind, count) in data.by_victory.iter() {
+                                for (kind, count) in data.by_reason.iter() {
                                     ui.text(kind);
                                     ui.next_column();
                                     ui.text(format!("{}", count));
