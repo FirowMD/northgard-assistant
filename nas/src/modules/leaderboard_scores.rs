@@ -279,8 +279,6 @@ impl LeaderboardScores {
             let mut code2 = CodeAssembler::new(64)?;
             let mut label_loop = code2.create_label();
 
-            code2.push(rbp)?;
-            code2.mov(rbp, rsp)?;
             code2.pushfq()?;
             code2.push(rax)?;
             code2.push(rbx)?;
@@ -290,7 +288,21 @@ impl LeaderboardScores {
             code2.push(r9)?;
             code2.push(r10)?;
             code2.push(r11)?;
-            code2.push(r12)?;
+
+            // Dynamically align stack to 16 bytes and persist the adjustment amount
+            code2.mov(rax, rsp)?;
+            code2.and(rax, 8)?;            // rax = 8 if misaligned (rsp % 16 == 8), else 0
+            code2.sub(rsp, rax)?;          // apply alignment fix
+            code2.sub(rsp, 8)?;            // reserve 8 bytes to store the adjustment
+            code2.mov(qword_ptr(rsp), rax)?; // store the adjustment value on stack
+
+            code2.sub(rsp, 0x60)?;
+            code2.movups(oword_ptr(rsp), xmm0)?;
+            code2.movups(oword_ptr(rsp + 0x10), xmm1)?;
+            code2.movups(oword_ptr(rsp + 0x20), xmm2)?;
+            code2.movups(oword_ptr(rsp + 0x30), xmm3)?;
+            code2.movups(oword_ptr(rsp + 0x40), xmm4)?;
+            code2.movups(oword_ptr(rsp + 0x50), xmm5)?;
 
             // Update `uid` in `mpman.net.Connection` and call Rust callback
             code2.mov(rbx, self.var_ptr_uid as u64)?;
@@ -359,7 +371,19 @@ impl LeaderboardScores {
             code2.call(rax)?;
             code2.add(rsp, 0x20)?;
 
-            code2.pop(r12)?;
+            code2.movups(xmm0, oword_ptr(rsp))?;
+            code2.movups(xmm1, oword_ptr(rsp + 0x10))?;
+            code2.movups(xmm2, oword_ptr(rsp + 0x20))?;
+            code2.movups(xmm3, oword_ptr(rsp + 0x30))?;
+            code2.movups(xmm4, oword_ptr(rsp + 0x40))?;
+            code2.movups(xmm5, oword_ptr(rsp + 0x50))?;
+            code2.add(rsp, 0x60)?;
+
+            // Restore dynamic alignment
+            code2.mov(rax, qword_ptr(rsp))?; // load the previously stored adjustment
+            code2.add(rsp, 8)?;              // remove the storage slot
+            code2.add(rsp, rax)?;            // undo the alignment fix
+
             code2.pop(r11)?;
             code2.pop(r10)?;
             code2.pop(r9)?;
@@ -369,7 +393,6 @@ impl LeaderboardScores {
             code2.pop(rbx)?;
             code2.pop(rax)?;
             code2.popfq()?;
-            code2.pop(rbp)?;
 
             self.injection_manager.apply_injection("getModes", self.address_getmodes, &mut code2)?;
 
@@ -386,6 +409,30 @@ impl LeaderboardScores {
             code3.push(rax)?;
             code3.push(rbx)?;
             code3.push(rcx)?;
+            code3.push(rdx)?;
+            code3.push(r8)?;
+            code3.push(r9)?;
+            code3.push(r10)?;
+            code3.push(r11)?;
+
+            code3.mov(rbx, rax)?; // Save rax
+
+            // Dynamically align stack to 16 bytes and persist the adjustment amount
+            code3.mov(rax, rsp)?;
+            code3.and(rax, 8)?;            // rax = 8 if misaligned (rsp % 16 == 8), else 0
+            code3.sub(rsp, rax)?;          // apply alignment fix
+            code3.sub(rsp, 8)?;            // reserve 8 bytes to store the adjustment
+            code3.mov(qword_ptr(rsp), rax)?; // store the adjustment value on stack
+
+            code3.sub(rsp, 0x60)?;
+            code3.movups(oword_ptr(rsp), xmm0)?;
+            code3.movups(oword_ptr(rsp + 0x10), xmm1)?;
+            code3.movups(oword_ptr(rsp + 0x20), xmm2)?;
+            code3.movups(oword_ptr(rsp + 0x30), xmm3)?;
+            code3.movups(oword_ptr(rsp + 0x40), xmm4)?;
+            code3.movups(oword_ptr(rsp + 0x50), xmm5)?;
+
+            code3.mov(rax, rbx)?; // Restore rax
             
             code3.mov(rbx, self.var_ptr_uid as u64)?;
             code3.inc(eax)?;
@@ -395,6 +442,24 @@ impl LeaderboardScores {
             code3.add(rcx, 0x30)?;
             code3.mov(qword_ptr(rbx), rcx)?;
             
+            code3.movups(xmm0, oword_ptr(rsp))?;
+            code3.movups(xmm1, oword_ptr(rsp + 0x10))?;
+            code3.movups(xmm2, oword_ptr(rsp + 0x20))?;
+            code3.movups(xmm3, oword_ptr(rsp + 0x30))?;
+            code3.movups(xmm4, oword_ptr(rsp + 0x40))?;
+            code3.movups(xmm5, oword_ptr(rsp + 0x50))?;
+            code3.add(rsp, 0x60)?;
+
+            // Restore dynamic alignment
+            code3.mov(rax, qword_ptr(rsp))?; // load the previously stored adjustment
+            code3.add(rsp, 8)?;              // remove the storage slot
+            code3.add(rsp, rax)?;            // undo the alignment fix
+
+            code3.pop(r11)?;
+            code3.pop(r10)?;
+            code3.pop(r9)?;
+            code3.pop(r8)?;
+            code3.pop(rdx)?;
             code3.pop(rcx)?;
             code3.pop(rbx)?;
             code3.pop(rax)?;
