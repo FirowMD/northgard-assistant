@@ -1,34 +1,16 @@
-/*
-    Win/Loss tracking overlay hooks template.
-
-    Hook the following function to detect wins and losses:
-    fn __constructor__@23326 (ui.win.EndGameScene, h3d.scene.Scene, bool, String, h2d.Object) -> void (27 regs, 169 ops)
-
-    Hook the following function to figure out that the mode is 3v3:
-    fn getTeamPlayerCount@7356 (GameState) -> i32 (12 regs, 30 ops)
-
-    Hook the following function to obtain `GameState` for the function above:
-    fn set_victory@7444 (GameState, ent.Player) -> ent.Player
-
-    TODO: Use GameState::getPlayersByTeam and the following function to convert result to String@13:
-    fn toString@126 (hl.types.ArrayObj) -> String (14 regs, 51 ops)
-*/
-
 use crate::modules::base::InjectionManager;
 use crate::modules::mem_alloc::{MemoryAllocator, DataType};
 use crate::modules::hashlink::*;
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use iced_x86::code_asm::*;
 use std::error::Error;
-use std::collections::HashMap;
-use std::fs;
 use std::path::PathBuf;
-use serde::{Deserialize, Serialize};
 
 const MAX_WINRATE_MEMORY_REGION_SIZE: usize = 0x2000;
 
 #[derive(PartialEq, Eq, Debug, Clone, Copy)]
 #[repr(i32)]
-enum EndGameKind {
+pub enum EndGameKind {
     None = 0,
     Defeat,
     Victory, // defaultVictory
@@ -43,16 +25,39 @@ enum EndGameKind {
     Yggdrasil,
 }
 
+impl EndGameKind {
+    #[inline]
+    fn from_u32(value: u32) -> EndGameKind {
+        match value {
+            0 => EndGameKind::None,
+            1 => EndGameKind::Defeat,
+            2 => EndGameKind::Victory,
+            3 => EndGameKind::Fame,
+            4 => EndGameKind::Helheim,
+            5 => EndGameKind::Faith,
+            6 => EndGameKind::Lore,
+            7 => EndGameKind::Mealsquirrel,
+            8 => EndGameKind::Odinsword,
+            9 => EndGameKind::Money,
+            10 => EndGameKind::Owltitan,
+            11 => EndGameKind::Yggdrasil,
+            _ => EndGameKind::None,
+        }
+    }
+}
+
+pub struct EndGameEvent {
+    pub kind: EndGameKind,
+}
+
 pub struct WinrateTracker {
     pid: u32,
     enabled: bool,
     file_path: PathBuf,
 
-    address_setvictory: usize,
+    address_ui_win_EndGame_init: usize,
     address_getteamplayercount: usize,
 
-    // Those address are taken from the following function:
-    // fn __constructor__@23326 (ui.win.EndGameScene, h3d.scene.Scene, bool, String, h2d.Object) -> void (27 regs, 169 ops)
     address_defeat: usize,
     address_defaultvictory: usize,
     address_escapebifrostvictory: usize,
@@ -72,14 +77,29 @@ pub struct WinrateTracker {
     var_ptr_gamestate: usize,
     var_ptr_teamplayercount: usize,
     var_ptr_endgamekind: usize,
+    var_ptr_callback: usize, // `update_winrate_callback` address
+}
+
+static ENDGAME_PENDING: AtomicBool = AtomicBool::new(false);
+static ENDGAME_KIND_ATOMIC: AtomicU32 = AtomicU32::new(0);
+
+extern "C" fn update_winrate_callback(endgame_kind: u32) {
+    ENDGAME_KIND_ATOMIC.store(endgame_kind, Ordering::Relaxed);
+    ENDGAME_PENDING.store(true, Ordering::Release);
+}
+
+pub fn take_pending_endgame() -> Option<EndGameEvent> {
+    if ENDGAME_PENDING.swap(false, Ordering::Acquire) {
+        let val = ENDGAME_KIND_ATOMIC.load(Ordering::Relaxed);
+        Some(EndGameEvent { kind: EndGameKind::from_u32(val) })
+    } else {
+        None
+    }
 }
 
 impl WinrateTracker {
-
     fn classify(kind: EndGameKind) -> (bool, Option<&'static str>) {
-        if kind == EndGameKind::Defeat {
-            return (false, None);
-        }
+        if kind == EndGameKind::Defeat { return (false, None); }
         let reason = match kind {
             k if k == EndGameKind::Victory => Some("defaultVictory"),
             k if k == EndGameKind::Fame => Some("fameVictory"),
@@ -96,78 +116,23 @@ impl WinrateTracker {
         (true, reason)
     }
 
-    pub fn poll_and_update(&mut self) -> Result<(), Box<dyn Error>> {
-        #[derive(Serialize, Deserialize, Default)]
-        struct WinrateData {
-            total_3v3: u32,
-            wins: u32,
-            losses: u32,
-            by_victory: HashMap<String, u32>,
-        }
-        let endgame_value: i32 = self.memory_allocator.read_var("EndGameKind")?;
-        if endgame_value == EndGameKind::None as i32 {
-            return Ok(());
-        }
-
-        let endgame_kind = match endgame_value {
-            0 => EndGameKind::None,
-            1 => EndGameKind::Defeat,
-            2 => EndGameKind::Victory,
-            3 => EndGameKind::Fame,
-            4 => EndGameKind::Helheim,
-            5 => EndGameKind::Faith,
-            6 => EndGameKind::Lore,
-            7 => EndGameKind::Mealsquirrel,
-            8 => EndGameKind::Odinsword,
-            9 => EndGameKind::Money,
-            10 => EndGameKind::Owltitan,
-            11 => EndGameKind::Yggdrasil,
-            _ => EndGameKind::None,
-        };
-
-        let (is_win, reason) = Self::classify(endgame_kind);
-
-        if let Some(parent) = self.file_path.parent() {
-            let _ = fs::create_dir_all(parent);
-        }
-
-        let mut data: WinrateData = match fs::read_to_string(&self.file_path) {
-            Ok(content) if !content.trim().is_empty() => serde_json::from_str(&content).unwrap_or_default(),
-            _ => WinrateData::default(),
-        };
-
-        data.total_3v3 = data.total_3v3.saturating_add(1);
-        if is_win {
-            data.wins = data.wins.saturating_add(1);
-            if let Some(key) = reason {
-                let entry = data.by_victory.entry(key.to_string()).or_insert(0);
-                *entry = entry.saturating_add(1);
-            }
-        } else {
-            data.losses = data.losses.saturating_add(1);
-        }
-
-        if let Ok(json) = serde_json::to_string_pretty(&data) {
-            let _ = fs::write(&self.file_path, json);
-        }
-
-        self.memory_allocator.write_var("EndGameKind", EndGameKind::None as i32)?;
-        Ok(())
-    }
-
     pub fn new(pid: u32) -> Result<Self, Box<dyn Error>> {
         let mut memory_allocator = MemoryAllocator::new(pid, MAX_WINRATE_MEMORY_REGION_SIZE)?;
 
         let var_ptr_gamestate = memory_allocator.allocate_var("GameState", DataType::Pointer)?;
         let var_ptr_teamplayercount = memory_allocator.allocate_var("TeamPlayerCount", DataType::I32)?;
         let var_ptr_endgamekind = memory_allocator.allocate_var("EndGameKind", DataType::I32)?;
+
+        let var_ptr_callback = memory_allocator.allocate_var("UpdateWinrateCallback", DataType::Pointer)?;
         
         memory_allocator.write_var("GameState", 0usize)?;
         memory_allocator.write_var("TeamPlayerCount", 0i32)?;
         memory_allocator.write_var("EndGameKind", 0i32)?;
 
+        memory_allocator.write_var("UpdateWinrateCallback", update_winrate_callback as usize)?;
+
         let mut injection_manager = InjectionManager::new(pid);
-        injection_manager.add_injection("set_victory".to_string());
+        injection_manager.add_injection("ui_win_EndGame_init".to_string());
         injection_manager.add_injection("get_teamplayercount".to_string());
         injection_manager.add_injection("defeat".to_string());
         injection_manager.add_injection("default_victory".to_string());
@@ -183,10 +148,10 @@ impl WinrateTracker {
         injection_manager.add_injection("yggdrasil_victory".to_string());
 
         let file_path: PathBuf = if let Ok(pd) = std::env::var("PROGRAMDATA") {
-            PathBuf::from(pd).join("northgard-assistant").join("winrate.json")
+            PathBuf::from(pd).join("northgard-tracker").join("winrate.json")
         } else {
             let base = dirs::data_dir().unwrap_or_else(|| PathBuf::from("."));
-            base.join("northgard-assistant").join("winrate.json")
+            base.join("northgard-tracker").join("winrate.json")
         };
 
         let mut winrate_tracker = Self {
@@ -194,7 +159,7 @@ impl WinrateTracker {
             enabled: false,
             file_path,
 
-            address_setvictory: 0,
+            address_ui_win_EndGame_init: 0,
             address_getteamplayercount: 0,
 
             address_defeat: 0,
@@ -216,17 +181,27 @@ impl WinrateTracker {
             var_ptr_gamestate,
             var_ptr_teamplayercount,
             var_ptr_endgamekind,
+            var_ptr_callback,
         };
         
         winrate_tracker.init()?;
-
         Ok(winrate_tracker)
     }
 
     pub fn init(&mut self) -> Result<(), Box<dyn Error>> {
+
         let guard = Hashlink::instance(self.pid).lock().unwrap();
         if let Some(hashlink) = guard.as_ref() {
-            self.address_setvictory = hashlink.get_function_address("set_victory", Some(0))?;
+            // xor r11,r11 <- trampoline
+            // mov [rbp-60],r11
+            // mov rcx,r10
+            // mov rdx,r11
+            // sub rsp,20
+            // call 76CA9F329430
+            const INIT_OFFSET: usize = 1017;
+            const INIT_INDEX: usize = 450; // magic!
+            self.address_ui_win_EndGame_init = hashlink.get_function_address("init", Some(INIT_INDEX))? + INIT_OFFSET;
+
             self.address_getteamplayercount = hashlink.get_function_address("getTeamPlayerCount", Some(0))?;
             self.address_defeat = hashlink.get_function_address("defeat", Some(0))?;
             self.address_defaultvictory = hashlink.get_function_address("defaultVictory", Some(0))?;
@@ -254,6 +229,25 @@ impl WinrateTracker {
         code.push(rbx)?;
         code.push(rcx)?;
         code.push(rdx)?;
+        code.push(r8)?;
+        code.push(r9)?;
+        code.push(r10)?;
+        code.push(r11)?;
+
+        // Dynamically align stack to 16 bytes and persist the adjustment amount
+        code.mov(rax, rsp)?;
+        code.and(rax, 8)?;            // rax = 8 if misaligned (rsp % 16 == 8), else 0
+        code.sub(rsp, rax)?;          // apply alignment fix
+        code.sub(rsp, 8)?;            // reserve 8 bytes to store the adjustment
+        code.mov(qword_ptr(rsp), rax)?; // store the adjustment value on stack
+
+        code.sub(rsp, 0x60)?;
+        code.movups(oword_ptr(rsp), xmm0)?;
+        code.movups(oword_ptr(rsp + 0x10), xmm1)?;
+        code.movups(oword_ptr(rsp + 0x20), xmm2)?;
+        code.movups(oword_ptr(rsp + 0x30), xmm3)?;
+        code.movups(oword_ptr(rsp + 0x40), xmm4)?;
+        code.movups(oword_ptr(rsp + 0x50), xmm5)?;
 
         code.mov(rbx, self.var_ptr_teamplayercount as u64)?;
         code.mov(eax, dword_ptr(rbx))?;
@@ -264,7 +258,32 @@ impl WinrateTracker {
         code.mov(rbx, self.var_ptr_endgamekind as u64)?;
         code.mov(dword_ptr(rbx), kind as u32)?;
 
+        code.mov(ecx, kind as i32)?;
+        code.mov(rbx, self.var_ptr_callback as u64)?;
+        code.mov(rax, qword_ptr(rbx))?;
+        code.sub(rsp, 0x120)?;
+        code.call(rax)?;
+        code.add(rsp, 0x120)?;
+
         code.set_label(&mut label_exit)?;
+
+        code.movups(xmm0, oword_ptr(rsp))?;
+        code.movups(xmm1, oword_ptr(rsp + 0x10))?;
+        code.movups(xmm2, oword_ptr(rsp + 0x20))?;
+        code.movups(xmm3, oword_ptr(rsp + 0x30))?;
+        code.movups(xmm4, oword_ptr(rsp + 0x40))?;
+        code.movups(xmm5, oword_ptr(rsp + 0x50))?;
+        code.add(rsp, 0x60)?;
+
+        // Restore dynamic alignment
+        code.mov(rax, qword_ptr(rsp))?; // load the previously stored adjustment
+        code.add(rsp, 8)?;              // remove the storage slot
+        code.add(rsp, rax)?;            // undo the alignment fix
+
+        code.pop(r11)?;
+        code.pop(r10)?;
+        code.pop(r9)?;
+        code.pop(r8)?;
         code.pop(rdx)?;
         code.pop(rcx)?;
         code.pop(rbx)?;
@@ -276,12 +295,7 @@ impl WinrateTracker {
 
     pub fn apply(&mut self, enable: bool) -> Result<(), Box<dyn Error>> {
         if enable {
-            /*
-            Injection: set_victory
-                1. Save `GameState` value
-                2. Call getTeamPlayerCount
-                3. Save result of `getTeamPlayerCount` to `var_ptr_teamplayercount`
-            */
+            // Injection: ui_win_EndGame_init
             let mut code = CodeAssembler::new(64)?;
             
             code.pushfq()?;
@@ -294,6 +308,23 @@ impl WinrateTracker {
             code.push(r10)?;
             code.push(r11)?;
 
+            // Dynamically align stack to 16 bytes and persist the adjustment amount
+            code.mov(rax, rsp)?;
+            code.and(rax, 8)?;            // rax = 8 if misaligned (rsp % 16 == 8), else 0
+            code.sub(rsp, rax)?;          // apply alignment fix
+            code.sub(rsp, 8)?;            // reserve 8 bytes to store the adjustment
+            code.mov(qword_ptr(rsp), rax)?; // store the adjustment value on stack
+
+            code.sub(rsp, 0x60)?;
+            code.movups(oword_ptr(rsp), xmm0)?;
+            code.movups(oword_ptr(rsp + 0x10), xmm1)?;
+            code.movups(oword_ptr(rsp + 0x20), xmm2)?;
+            code.movups(oword_ptr(rsp + 0x30), xmm3)?;
+            code.movups(oword_ptr(rsp + 0x40), xmm4)?;
+            code.movups(oword_ptr(rsp + 0x50), xmm5)?;
+
+            code.mov(rcx, r10)?; // we are at center of the function, r10 is the first argument
+
             code.mov(rbx, self.var_ptr_gamestate as u64)?;
             code.mov(qword_ptr(rbx), rcx)?;
             code.mov(rax, self.address_getteamplayercount as u64)?;
@@ -303,6 +334,19 @@ impl WinrateTracker {
             
             code.mov(rbx, self.var_ptr_teamplayercount as u64)?;
             code.mov(dword_ptr(rbx), eax)?;
+
+            code.movups(xmm0, oword_ptr(rsp))?;
+            code.movups(xmm1, oword_ptr(rsp + 0x10))?;
+            code.movups(xmm2, oword_ptr(rsp + 0x20))?;
+            code.movups(xmm3, oword_ptr(rsp + 0x30))?;
+            code.movups(xmm4, oword_ptr(rsp + 0x40))?;
+            code.movups(xmm5, oword_ptr(rsp + 0x50))?;
+            code.add(rsp, 0x60)?;
+
+            // Restore dynamic alignment
+            code.mov(rax, qword_ptr(rsp))?; // load the previously stored adjustment
+            code.add(rsp, 8)?;              // remove the storage slot
+            code.add(rsp, rax)?;            // undo the alignment fix
 
             code.pop(r11)?;
             code.pop(r10)?;
@@ -314,13 +358,9 @@ impl WinrateTracker {
             code.pop(rax)?;
             code.popfq()?;
 
-            self.injection_manager.apply_injection("set_victory", self.address_setvictory, &mut code)?;
+            self.injection_manager.apply_injection("ui_win_EndGame_init", self.address_ui_win_EndGame_init, &mut code)?;
 
-            /*
-            Injection: EndGameScene
-                1. Save result of game to `var_ptr_endgamekind`
-                2. Emit `WinrateTrackerCallback`
-            */
+            // Injection: EndGameScene
             let mut code = self.create_endgame_code(EndGameKind::Defeat)?;
             self.injection_manager.apply_injection("defeat", self.address_defeat, &mut code)?;
 
@@ -354,7 +394,7 @@ impl WinrateTracker {
             let mut code = self.create_endgame_code(EndGameKind::Yggdrasil)?;
             self.injection_manager.apply_injection("yggdrasil_victory", self.address_yggdrasilvictory, &mut code)?;
         } else {
-            self.injection_manager.remove_injection("set_victory")?;
+            self.injection_manager.remove_injection("ui_win_EndGame_init")?;
             self.injection_manager.remove_injection("get_teamplayercount")?;
             self.injection_manager.remove_injection("defeat")?;
             self.injection_manager.remove_injection("default_victory")?;
@@ -372,5 +412,9 @@ impl WinrateTracker {
 
         self.enabled = enable;
         Ok(())
+    }
+
+    pub fn free(&self) -> Result<(), Box<dyn Error>> {
+        self.memory_allocator.free()
     }
 }
