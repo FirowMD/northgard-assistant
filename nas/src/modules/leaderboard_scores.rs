@@ -14,6 +14,7 @@ use windows::Win32::System::Memory::{PAGE_EXECUTE, PAGE_EXECUTE_READ, PAGE_EXECU
 use windows::Win32::Foundation::BOOL;
 use iced_x86::code_asm::*;
 use std::error::Error;
+use std::sync::atomic::{AtomicUsize, AtomicBool, Ordering};
 
 const MAX_LB_MEMORY_REGION_SIZE: usize = 0x10000;
 const MAX_LB_SEND_BUFSIZE: i32 = 0x1000;
@@ -85,8 +86,8 @@ pub struct LeaderboardScores {
     var_ptr_uid: usize, // uid value itself
     
     // Callback infrastructure
-    var_ptr_self_instance: usize, // pointer to this LeaderboardScores instance
-    var_ptr_callback_addr: usize, // address of the callback function
+    var_ptr_callback: usize,
+    var_ptr_resp_callback: usize,
 
     sendbuf_size: i32,
     
@@ -94,26 +95,30 @@ pub struct LeaderboardScores {
     request_builder: LeaderboardRequestBuilder,
 }
 
+static LEADERBOARD_INSTANCE_PTR: AtomicUsize = AtomicUsize::new(0);
+static LB_PENDING: AtomicBool = AtomicBool::new(false);
+
+pub struct LeaderboardResponse {
+    pub data: Vec<u8>,
+}
+
 impl LeaderboardScores {
-    // Called from the `getModes` injection
-    // Updates uid in request
-    extern "win64" fn update_request_callback(instance_ptr: *mut LeaderboardScores, uid: u32) -> i32 {
+    extern "C" fn update_leaderboard_callback(uid: u32) {
         if uid == 0 || uid > 1000000 {
-            return -3;
+            return;
         }
-        
+        let ptr = LEADERBOARD_INSTANCE_PTR.load(Ordering::Relaxed);
+        if ptr == 0 {
+            return;
+        }
         unsafe {
-            let instance = &mut *instance_ptr;
-            
-            if instance.pid == 0 || instance.pid > 65535 {
-                return -4;
-            }
-            
-            match instance.update_request_with_uid(uid) {
-                Ok(()) => 0,
-                Err(_) => -2,
-            }
+            let instance = &mut *(ptr as *mut LeaderboardScores);
+            let _ = instance.update_request_with_uid(uid);
         }
+    }
+
+    extern "C" fn update_leaderboard_response_callback() {
+        LB_PENDING.store(true, Ordering::Release);
     }
     
     pub fn new(pid: u32) -> Result<Self, Box<dyn Error>> {
@@ -127,8 +132,8 @@ impl LeaderboardScores {
         let var_ptr_uid = memory_allocator.allocate_var("UID", DataType::I32)?;
         
         // Callback infrastructure
-        let var_ptr_self_instance = memory_allocator.allocate_var("SelfInstance", DataType::Pointer)?;
-        let var_ptr_callback_addr = memory_allocator.allocate_var("CallbackAddr", DataType::Pointer)?;
+        let var_ptr_callback = memory_allocator.allocate_var("UpdateLeaderboardCallback", DataType::Pointer)?;
+        let var_ptr_resp_callback = memory_allocator.allocate_var("UpdateLeaderboardResponseCallback", DataType::Pointer)?;
 
         let mut injection_manager = InjectionManager::new(pid);
         injection_manager.add_injection("getModes".to_string());
@@ -150,8 +155,8 @@ impl LeaderboardScores {
             var_ptr_socket,
             var_ptr_connection_uid,
             var_ptr_uid,
-            var_ptr_self_instance,
-            var_ptr_callback_addr,
+            var_ptr_callback,
+            var_ptr_resp_callback,
             sendbuf_size: MAX_LB_SEND_BUFSIZE,
             request_builder: LeaderboardRequestBuilder::new(LeaderboardType::Duels, LB_OPLAYER_COUNT_DEFAULT),
         };
@@ -196,14 +201,11 @@ impl LeaderboardScores {
     }
     
     fn setup_callback_infrastructure(&mut self) -> Result<(), Box<dyn Error>> {
-        // Store the address of the callback function
-        let callback_addr = Self::update_request_callback as *const () as usize;
-        self.memory_allocator.write_var("CallbackAddr", callback_addr)?;
-        
-        // Store pointer to this instance (will be updated when calling from assembly)
-        let self_ptr = self as *const Self as usize;
-        self.memory_allocator.write_var("SelfInstance", self_ptr)?;
-        
+        let callback_addr = Self::update_leaderboard_callback as *const () as usize;
+        self.memory_allocator.write_var("UpdateLeaderboardCallback", callback_addr)?;
+        let resp_addr = Self::update_leaderboard_response_callback as *const () as usize;
+        self.memory_allocator.write_var("UpdateLeaderboardResponseCallback", resp_addr)?;
+        LEADERBOARD_INSTANCE_PTR.store(self as *const Self as usize, Ordering::Relaxed);
         Ok(())
     }
     
@@ -300,20 +302,11 @@ impl LeaderboardScores {
             // Request buffer
             //
 
-            // Update instance pointer with current self reference and call callback
-            // Update the instance pointer in memory with current self address
-            code2.mov(r12, self as *const Self as u64)?; // Current instance address
-            code2.mov(rbx, self.var_ptr_self_instance as u64)?;
-            code2.mov(qword_ptr(rbx), r12)?; // Store current instance pointer
-            
-            // Now call the callback with updated pointer
-            code2.mov(rcx, r12)?; // instance pointer in RCX
-            code2.mov(edx, eax)?; // uid value in EDX (32-bit to 32-bit)
-            
-            code2.mov(rbx, self.var_ptr_callback_addr as u64)?;
-            code2.mov(r11, qword_ptr(rbx))?; // callback address in R11
+            code2.mov(ecx, eax)?;
+            code2.mov(rbx, self.var_ptr_callback as u64)?;
+            code2.mov(rax, qword_ptr(rbx))?;
             code2.sub(rsp, 0x20)?;
-            code2.call(r11)?; // call the callback
+            code2.call(rax)?;
             code2.add(rsp, 0x20)?;
 
             //
@@ -359,6 +352,12 @@ impl LeaderboardScores {
             code2.add(r10, rax)?;
             code2.cmp(eax, 0)?;
             code2.jg(label_loop)?;
+
+            code2.mov(rbx, self.var_ptr_resp_callback as u64)?;
+            code2.mov(rax, qword_ptr(rbx))?;
+            code2.sub(rsp, 0x20)?;
+            code2.call(rax)?;
+            code2.add(rsp, 0x20)?;
 
             code2.pop(r12)?;
             code2.pop(r11)?;
@@ -494,5 +493,22 @@ impl LeaderboardScores {
         self.update_request_with_uid(placeholder_uid)?;
         
         Ok(())
+    }
+
+    pub fn take_pending_leaderboard() -> Option<LeaderboardResponse> {
+        if LB_PENDING.swap(false, Ordering::Acquire) {
+            let ptr = LEADERBOARD_INSTANCE_PTR.load(Ordering::Relaxed);
+            if ptr == 0 { return None; }
+            unsafe {
+                let instance = &*(ptr as *const LeaderboardScores);
+                if let Ok(bytes) = instance.get_recv_buffer() {
+                    Some(LeaderboardResponse { data: bytes })
+                } else {
+                    None
+                }
+            }
+        } else {
+            None
+        }
     }
 }
