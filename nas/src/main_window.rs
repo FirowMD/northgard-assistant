@@ -16,7 +16,6 @@ use crate::modules::game_common::GameCommon;
 use crate::modules::build_guide::{BuildGuideManager};
 use crate::modules::winrate_tracker::WinrateTracker;
 use crate::modules::{callback_system, winrate_tracker};
-use crate::modules::leaderboard_scores::{LeaderboardScores, LeaderboardType, LeaderboardResponse};
 use crate::core::building_window::BuildingWindow;
 use crate::core::lore_window::LoreWindow;
 use crate::core::warband_window::WarbandWindow;
@@ -85,11 +84,6 @@ pub struct MainWindow {
     selected_guide: Option<String>,
     winrate_tracker: Option<WinrateTracker>,
     winrate_enabled: bool,
-    leaderboard_scores: Option<LeaderboardScores>,
-    leaderboard_enabled: bool,
-    leaderboard_type_idx: usize,
-    leaderboard_count_idx: usize,
-    leaderboard_last_json: Option<String>,
 }
 
 impl MainWindow {
@@ -113,11 +107,6 @@ impl MainWindow {
             selected_guide: None,
             winrate_tracker: None,
             winrate_enabled: false,
-            leaderboard_scores: None,
-            leaderboard_enabled: false,
-            leaderboard_type_idx: 0,
-            leaderboard_count_idx: 1,
-            leaderboard_last_json: None,
         }
     }
 
@@ -250,18 +239,6 @@ impl ImguiRenderLoop for MainWindow {
             }
         }
 
-        match LeaderboardScores::new(self.pid) {
-            Ok(lb) => {
-                self.leaderboard_scores = Some(lb);
-                tracing::info!("Successfully initialized LeaderboardScores");
-                callback_system::instance().register(|event: &LeaderboardResponse| {
-                    tracing::info!("Leaderboard response received: {} bytes", event.data.len());
-                });
-            }
-            Err(e) => {
-                tracing::error!("Failed to initialize LeaderboardScores: {}", e);
-            }
-        }
     }
 
     fn render(&mut self, ui: &mut imgui::Ui) {
@@ -279,11 +256,6 @@ impl ImguiRenderLoop for MainWindow {
             }
         }
 
-        if self.leaderboard_enabled {
-            if let Some(event) = crate::modules::leaderboard_scores::LeaderboardScores::take_pending_leaderboard() {
-                callback_system::instance().emit(event);
-            }
-        }
 
         callback_system::instance().update();
 
@@ -381,78 +353,6 @@ impl ImguiRenderLoop for MainWindow {
 
                     ui.separator();
 
-                    if ui.collapsing_header("Leaderboard Scores", imgui::TreeNodeFlags::empty()) {
-                        if let Some(lb) = &mut self.leaderboard_scores {
-                            let prev_state_lb = self.leaderboard_enabled;
-                            if ui.checkbox("Enable Leaderboard Scores", &mut self.leaderboard_enabled) {
-                                if let Err(e) = lb.apply(self.leaderboard_enabled) {
-                                    tracing::error!("Leaderboard scores failed: {}", e);
-                                    self.leaderboard_enabled = prev_state_lb;
-                                } else {
-                                    tracing::info!(
-                                        "Leaderboard scores {}",
-                                        if self.leaderboard_enabled { "enabled" } else { "disabled" }
-                                    );
-                                }
-                            }
-
-                            let lb_types = ["Duels", "FreeForAll", "Teams"];
-                            let current_type = lb_types[self.leaderboard_type_idx];
-                            if let Some(token) = ui.begin_combo("##lb_type_combo", current_type) {
-                                for (idx, name) in lb_types.iter().enumerate() {
-                                    let is_selected = idx == self.leaderboard_type_idx;
-                                    if ui.selectable_config(name).selected(is_selected).build() {
-                                        self.leaderboard_type_idx = idx;
-                                        let ty = match idx { 0 => LeaderboardType::Duels, 1 => LeaderboardType::FreeForAll, _ => LeaderboardType::Teams };
-                                        if let Err(e) = lb.set_leaderboard_type(ty) {
-                                            tracing::error!("Failed to set leaderboard type: {}", e);
-                                        }
-                                    }
-                                }
-                                token.end();
-                            }
-
-                            let count_options = [20, 40, 80, 120, 200];
-                            let current_count = count_options[self.leaderboard_count_idx];
-                            if let Some(token) = ui.begin_combo("##lb_count_combo", &format!("{} players", current_count)) {
-                                for (idx, count) in count_options.iter().enumerate() {
-                                    let is_selected = idx == self.leaderboard_count_idx;
-                                    if ui.selectable_config(&format!("{} players", count)).selected(is_selected).build() {
-                                        self.leaderboard_count_idx = idx;
-                                        if let Err(e) = lb.set_observable_player_count(*count as i32) {
-                                            tracing::error!("Failed to set player count: {}", e);
-                                        }
-                                    }
-                                }
-                                token.end();
-                            }
-
-                            if ui.button("Read Latest Result") {
-                                match lb.get_recv_buffer() {
-                                    Ok(bytes) => {
-                                        let text = String::from_utf8_lossy(&bytes).to_string();
-                                        self.leaderboard_last_json = Some(text);
-                                    }
-                                    Err(e) => {
-                                        tracing::error!("Failed to read leaderboard buffer: {}", e);
-                                    }
-                                }
-                            }
-
-                            if let Some(text) = &self.leaderboard_last_json {
-                                ui.child_window("leaderboard_json")
-                                    .size([0.0, 160.0])
-                                    .border(true)
-                                    .build(|| {
-                                        ui.text_wrapped(text);
-                                    });
-                            } else {
-                                ui.text_disabled("No leaderboard response read yet");
-                            }
-                        } else {
-                            ui.text_disabled("Leaderboard module not initialized");
-                        }
-                    }
 
                     if let Some(auto_lockin) = &mut self.auto_lockin {
                         if let Some(clans) = auto_lockin.get_clans_game() {

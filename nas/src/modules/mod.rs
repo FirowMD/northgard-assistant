@@ -10,7 +10,6 @@ pub mod lobby_members;
 pub mod lore_hook;
 pub mod mem_alloc;
 pub mod build_guide;
-pub mod leaderboard_scores;
 pub mod winrate_tracker;
 pub mod winrate_store;
 
@@ -25,6 +24,5 @@ pub use lobby_members::*;
 pub use lore_hook::*;
 pub use mem_alloc::*;
 pub use build_guide::*;
-pub use leaderboard_scores::*;
 pub use winrate_tracker::*;
 pub use winrate_store::*;
